@@ -1,1086 +1,1284 @@
-#! /usr/bin/env python
+#!/usr/local/bin/python
 """
 $Id$
 
-cf
 
+This module implements a Nptation3 parser, and the final
+part of a notation3 serializer.
+
+See also:
+
+Notation 3
 http://www.w3.org/DesignIssues/Notation3
-Date: 2000/07/17 21:46:13  
 
-DWC:
-oops... I'm not doing qname expansion as described
-there (i.e. adding a # if it's not already there).
+Closed World Machine - and RDF Processor
+http://www.w3.org/2000/10/swap/cwm
 
-I allow unprefixed qnames, so not all barenames
-are keywords.
+To DO: See also "@@" in comments
 
----- hmmmm ... not expandable - a bit of a trap.
+- Clean up interfaces
+______________________________________________
 
-I haven't done quoting yet.
+Module originally by Dan Connolly, includeing notation3
+parser and RDF generator. TimBL added RDF stream model
+and N3 generation, replaced stream model with use
+of common store/formula API.  Yosi Scharf developped
+the module, including tests and test harness.
 
-idea: migrate toward CSS notation?
-
-idea: use notation3 for wiki record keeping.
-
-TBL: more cool things:
- - sucking in the schema (http library?) - to know about r see r
- - metaindexes - "to know more about x please see r" - described by
- - equivalence handling inc. equivalence of equivalence
- - @@ regeneration of genids on output.
-- regression test - done once
- Shakedown:
- - Find all synonyms of synonym
- - Find closure for all synonyms
- - Find superclass closure?
- - Use unambiguous property to infer synomnyms
-
- - Separate the store hash table from the parser. (Intern twice?!)
- 
- Manipulation:
-  { } as notation for bag of statements
-  - filter 
-  - graph match
-  - recursive dump of nested bags
-Validation:  validate domain and range constraints against closuer of classes and
-   mutually disjoint classes.
-
-Translation;  Try to represent the space (or a context) using a subset of namespaces
+2013-11-07 Added naked dateZ and datetimeZ literal parsing
 
 """
 
+
+# Python standard libraries
+import types, sys
 import string
-import urlparse
+import codecs # python 2-ism; for writing utf-8 in RDF/xml output
+import urllib
 import re
+from warnings import warn
+
+from sax2rdf import XMLtoDOM # Incestuous.. would be nice to separate N3 and XML
+
+# SWAP http://www.w3.org/2000/10/swap
+from diag import verbosity, setVerbosity, progress
+from uripath import refTo, join
+import uripath
+import RDFSink
+from RDFSink import CONTEXT, PRED, SUBJ, OBJ, PARTS, ALL4
+from RDFSink import  LITERAL, XMLLITERAL, LITERAL_DT, LITERAL_LANG, ANONYMOUS, SYMBOL
+from RDFSink import Logic_NS
+import diag
+from xmlC14n import Canonicalize
+
+from why import BecauseOfData, becauseSubexpression
+
+N3_forSome_URI = RDFSink.forSomeSym
+N3_forAll_URI = RDFSink.forAllSym
 
 # Magic resources we know about
 
-RDF_type_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-DAML_equivalentTo_URI = "http://www.daml.org/2000/10/daml-ont#equivalentTo"
 
-# The statement is stored as a quad - affectionately known as a triple ;-)
+from RDFSink import RDF_type_URI, RDF_NS_URI, DAML_sameAs_URI, parsesTo_URI
+from RDFSink import RDF_spec, List_NS, uniqueURI
+from local_decimal import Decimal
 
-CONTEXT = 0
-PRED = 1  # offsets when a statement is stored as a Python tuple (p, s, o, c)
-SUBJ = 2
-OBJ = 3
+ADDED_HASH = "#"  # Stop where we use this in case we want to remove it!
+# This is the hash on namespace URIs
 
-PARTS =  PRED, SUBJ, OBJ
-ALL4 = CONTEXT, PRED, SUBJ, OBJ
+RDF_type = ( SYMBOL , RDF_type_URI )
+DAML_sameAs = ( SYMBOL, DAML_sameAs_URI )
 
-# The parser outputs quads where each item is a pair   type, value
+from RDFSink import N3_first, N3_rest, N3_nil, N3_li, N3_List, N3_Empty
 
-RESOURCE = 0        # which or may not have a fragment
-LITERAL = 2         # string etc - maps to data:
-ANONYMOUS = 3       # existentially qualified unlabelled resource
-VARIABLE = 4        # 
+LOG_implies_URI = "http://www.w3.org/2000/10/swap/log#implies"
 
-RDF_type = ( RESOURCE , RDF_type_URI )
-DAML_equivalentTo = ( RESOURCE, DAML_equivalentTo_URI )
-
-
-chatty = 0   # verbosity flag
+INTEGER_DATATYPE = "http://www.w3.org/2001/XMLSchema#integer"
+FLOAT_DATATYPE = "http://www.w3.org/2001/XMLSchema#double"
+DECIMAL_DATATYPE = "http://www.w3.org/2001/XMLSchema#decimal"
+BOOLEAN_DATATYPE = "http://www.w3.org/2001/XMLSchema#boolean"
+DATE_DATATYPE = "http://www.w3.org/2001/XMLSchema#date"
+DATETIME_DATATYPE = "http://www.w3.org/2001/XMLSchema#dateTime"
 
 option_noregen = 0   # If set, do not regenerate genids on output
 
+# @@ I18n - the notname chars need extending for well known unicode non-text
+# characters. The XML spec switched to assuming unknown things were name
+# characaters.
+# _namechars = string.lowercase + string.uppercase + string.digits + '_-'
+_notQNameChars = "\t\r\n !\"#$%&'()*.,+/;<=>?@[\\]^`{|}~" # else valid qname :-/
+_notNameChars = _notQNameChars + ":"  # Assume anything else valid name :-/
+_rdfns = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+
+
 N3CommentCharacter = "#"     # For unix script #! compatabilty
 
+########################################## Parse string to sink
+#
+# Regular expressions:
+eol = re.compile(r'[ \t]*(#[^\n]*)?\r?\n')      # end  of line, poss. w/comment
+eof = re.compile(r'[ \t]*(#[^\n]*)?$')          # end  of file, poss. w/comment
+ws = re.compile(r'[ \t]*')                      # Whitespace not including NL
+signed_integer = re.compile(r'[-+]?[0-9]+')     # integer
+number_syntax = re.compile(r'(?P<integer>[-+]?[0-9]+)(?P<decimal>\.[0-9]+)?(?P<exponent>e[-+]?[0-9]+)?')
+datetime_syntax = re.compile(r'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9](T[0-9][0-9]:[0-9][0-9](:[0-9][0-9](\.[0-9]*)?)?)?Z?');
+digitstring = re.compile(r'[0-9]+')             # Unsigned integer
+interesting = re.compile(r'[\\\r\n\"]')
+langcode = re.compile(r'[a-zA-Z0-9]+(-[a-zA-Z0-9]+)?')
+#"
+
+
+
 class SinkParser:
-    def __init__(self, sink, thisDoc, baseURI="", bindings = {},
-                 genPrefix = "", varPrefix = ""):
-	""" note: namespace names should *not* end in #;
-	the # will get added during qname processing """
-        self._sink = sink
-    	self._bindings = bindings
-	self._thisDoc = thisDoc
-        self._baseURI = baseURI
-	self._context = RESOURCE , self._thisDoc    # For storing with triples
-        self._contextStack = []      # For nested conjunctions { ... }
-        self._varPrefix = varPrefix
-        self._nextId = 0
+    def __init__(self, store, openFormula=None, thisDoc="", baseURI=None,
+                 genPrefix = "", metaURI=None, flags="",
+                 why=None):
+        """ note: namespace names should *not* end in #;
+        the # will get added during qname processing """
+
+        self._bindings = {}
+        self._flags = flags
+        if thisDoc != "":
+            assert ':' in thisDoc, "Document URI not absolute: <%s>" % thisDoc
+            self._bindings[""] = thisDoc + "#"  # default
+
+        self._store = store
+        if genPrefix: store.setGenPrefix(genPrefix) # pass it on
+        
+        self._thisDoc = thisDoc
+        self.lines = 0              # for error handling
+        self.startOfLine = 0        # For calculating character number
         self._genPrefix = genPrefix
+        self.keywords = ['a', 'this', 'bind', 'has', 'is', 'of', 'true', 'false' ]
+        self.keywordsSet = 0    # Then only can others be considerd qnames
+        self._anonymousNodes = {} # Dict of anon nodes already declared ln: Term
+        self._variables  = {}
+        self._parentVariables = {}
+        self._reason = why      # Why the parser was asked to parse this
 
-        if not self._baseURI: self._baseURI = self._thisDoc
-        if not self._genPrefix: self._genPrefix = self._thisDoc + "#_g"
-        if not self._varPrefix: self._varPrefix = self._thisDoc + "#_v"
+        self._reason2 = None    # Why these triples
+        if diag.tracking: self._reason2 = BecauseOfData(
+                        store.newSymbol(thisDoc), because=self._reason) 
 
-    def feed(self, str):
-	"""if BadSyntax is raised, the string
-	passed in the exception object is the
-	remainder after any statements have been parsed.
-	So if there is more data to feed to the
-	parser, it should be straightforward to recover."""
+        if baseURI: self._baseURI = baseURI
+        else:
+            if thisDoc:
+                self._baseURI = thisDoc
+            else:
+                self._baseURI = None
+
+        assert not self._baseURI or ':' in self._baseURI
+
+        if not self._genPrefix:
+            if self._thisDoc: self._genPrefix = self._thisDoc + "#_g"
+            else: self._genPrefix = uniqueURI()
+
+        if openFormula ==None:
+            if self._thisDoc:
+                self._formula = store.newFormula(thisDoc + "#_formula")
+            else:
+                self._formula = store.newFormula()
+        else:
+            self._formula = openFormula
+        
+
+        self._context = self._formula
+        self._parentContext = None
+        
+        if metaURI:
+            self.makeStatement((SYMBOL, metaURI), # relate doc to parse tree
+                            (SYMBOL, PARSES_TO_URI ), #pred
+                            (SYMBOL, thisDoc),  #subj
+                            self._context)                      # obj
+            self.makeStatement(((SYMBOL, metaURI), # quantifiers - use inverse?
+                            (SYMBOL, N3_forSome_URI), #pred
+                            self._context,  #subj
+                            subj))                      # obj
+
+    def here(self, i):
+        """String generated from position in file
+        
+        This is for repeatability when refering people to bnodes in a document.
+        This has diagnostic uses less formally, as it should point one to which 
+        bnode the arbitrary identifier actually is. It gives the
+        line and character number of the '[' charcacter or path character
+        which introduced the blank node. The first blank node is boringly _L1C1.
+        It used to be used only for tracking, but for tests in general
+        it makes the canonical ordering of bnodes repeatable."""
+
+        return "%s_L%iC%i" % (self._genPrefix , self.lines,
+                                            i - self.startOfLine + 1) 
+        
+    def formula(self):
+        return self._formula
+    
+    def loadStream(self, stream):
+        return self.loadBuf(stream.read())   # Not ideal
+
+    def loadBuf(self, buf):
+        """Parses a buffer and returns its top level formula"""
+        self.startDoc()
+        self.feed(buf)
+        return self.endDoc()    # self._formula
+
+
+    def feed(self, octets):
+        """Feed an octet stream tothe parser
+        
+        if BadSyntax is raised, the string
+        passed in the exception object is the
+        remainder after any statements have been parsed.
+        So if there is more data to feed to the
+        parser, it should be straightforward to recover."""
+        str = octets.decode('utf-8')
         i = 0
-	while i >= 0:
-	    j = self.skipSpace(str, i)
-	    if j<0: return
+        while i >= 0:
+            j = self.skipSpace(str, i)
+            if j<0: return
 
             i = self.directiveOrStatement(str,j)
             if i<0:
-                print "# next char: ", `str[j]` 
-                raise BadSyntax(str, j, "expected directive or statement")
+                # print "# next char: ", `str[j]`
+                raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                    "expected directive or statement")
 
     def directiveOrStatement(self, str,h):
     
-	    i = self.skipSpace(str, h)
-	    if i<0: return i   # EOF
+            i = self.skipSpace(str, h)
+            if i<0: return i   # EOF
 
-	    j = self.directive(str, i)
-	    if j>=0: return  self.checkDot(str,j)
-	    
+            j = self.directive(str, i)
+            if j>=0: return  self.checkDot(str,j)
+            
             j = self.statement(str, i)
             if j>=0: return self.checkDot(str,j)
             
-	    return j
+            return j
 
 
     #@@I18N
-    _namechars = string.lowercase + string.uppercase + string.digits + '_'
-
-    def tok(self, tok, str, i):
-        """tokenizer strips whitespace and comment"""
-        j = self.skipSpace(str,i)
-        if j<0: return j
-        i = j
+    global _notNameChars
+    #_namechars = string.lowercase + string.uppercase + string.digits + '_-'
         
-#	while 1:
-#            while i<len(str) and str[i] in string.whitespace:
-#                i = i + 1
-#            if i == len(str): return -1
-#            if str[i] == N3CommentCharacter:     # "#"?
-#                while i<len(str) and str[i] != "\n":
-#                    i = i + 1
-#            else: break
-	if str[i:i+len(tok)] == tok:
-	    i = i + len(tok)
-	    return i
-	else:
-	    return -1
+    def tok(self, tok, str, i):
+        """Check for keyword.  Space must have been stripped on entry and
+        we must not be at end of file."""
+        
+        assert tok[0] not in _notNameChars # not for punctuation
+        # was: string.whitespace which is '\t\n\x0b\x0c\r \xa0' -- not ascii
+        whitespace = '\t\n\x0b\x0c\r ' 
+        if str[i:i+1] == "@":
+            i = i+1
+        else:
+            if tok not in self.keywords:
+                return -1   # No, this has neither keywords declaration nor "@"
+
+        if (str[i:i+len(tok)] == tok
+            and (str[i+len(tok)] in  _notQNameChars )): 
+            i = i + len(tok)
+            return i
+        else:
+            return -1
 
     def directive(self, str, i):
-	j = self.tok('bind', str, i)
-	if j<0: return -1
-	t = []
-	i = self.qname(str, j, t)
-	if i<0: raise BadSyntax(str, j, "expected qname after bind")
-	j = self.uri_ref2(str, i, t)
-	if j<0: raise BadSyntax(str, i, "expected uriref2 after bind _qname_")
+        j = self.skipSpace(str, i)
+        if j<0: return j # eof
+        res = []
+        
+        j = self.tok('bind', str, i)        # implied "#". Obsolete.
+        if j>0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                "keyword bind is obsolete: use @prefix")
 
-	self._bindings[t[0][0]] = t[1][1]
-	self.bind(t[0][0], t[1] [1])
-	return j
+        j = self.tok('keywords', str, i)
+        if j>0:
+            i = self.commaSeparatedList(str, j, res, self.bareWord)
+            if i < 0:
+                raise BadSyntax(self._thisDoc, self.lines, str, i,
+                    "'@keywords' needs comma separated list of words")
+            self.setKeywords(res[:])
+            if diag.chatty_flag > 80: progress("Keywords ", self.keywords)
+            return i
 
-    def bind(self, qn, uriref):
-        self._sink.bind(qn, uriref)
+
+        j = self.tok('forAll', str, i)
+        if j > 0:
+            i = self.commaSeparatedList(str, j, res, self.uri_ref2)
+            if i <0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                        "Bad variable list after @forAll")
+            for x in res:
+                #self._context.declareUniversal(x)
+                if x not in self._variables or x in self._parentVariables:
+                    self._variables[x] =  self._context.newUniversal(x)
+            return i
+
+        j = self.tok('forSome', str, i)
+        if j > 0:
+            i = self. commaSeparatedList(str, j, res, self.uri_ref2)
+            if i <0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                    "Bad variable list after @forSome")
+            for x in res:
+                self._context.declareExistential(x)
+            return i
+
+
+        j=self.tok('prefix', str, i)   # no implied "#"
+        if j>=0:
+            t = []
+            i = self.qname(str, j, t)
+            if i<0: raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                "expected qname after @prefix")
+            j = self.uri_ref2(str, i, t)
+            if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                "expected <uriref> after @prefix _qname_")
+            ns = self.uriOf(t[1])
+
+            if self._baseURI:
+                ns = join(self._baseURI, ns)
+            elif ":" not in ns:
+                 raise BadSyntax(self._thisDoc, self.lines, str, j,
+                    "With no base URI, cannot use relative URI in @prefix <"+ns+">")
+            assert ':' in ns # must be absolute
+            self._bindings[t[0][0]] = ns
+            self.bind(t[0][0], hexify(ns))
+            return j
+
+        j=self.tok('base', str, i)      # Added 2007/7/7
+        if j >= 0:
+            t = []
+            i = self.uri_ref2(str, j, t)
+            if i<0: raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                "expected <uri> after @base ")
+            ns = self.uriOf(t[0])
+
+            if self._baseURI:
+                ns = join(self._baseURI, ns)
+            elif ':' not in ns:
+                raise BadSyntax(self._thisDoc, self.lines, str, j,
+                    "With no previous base URI, cannot use relative URI in @base  <"+ns+">")
+            assert ':' in ns # must be absolute
+            self._baseURI = ns
+            return i
+
+        return -1  # Not a directive, could be something else.
+
+    def bind(self, qn, uri):
+        assert isinstance(uri,
+                    types.StringType), "Any unicode must be %x-encoded already"
+        if qn == "":
+            self._store.setDefaultNamespace(uri)
+        else:
+            self._store.bind(qn, uri)
+
+    def setKeywords(self, k):
+        "Takes a list of strings"
+        if k == None:
+            self.keywordsSet = 0
+        else:
+            self.keywords = k
+            self.keywordsSet = 1
+
 
     def startDoc(self):
-        self._sink.startDoc()
+        self._store.startDoc()
 
     def endDoc(self):
-        self._sink.endDoc()
+        """Signal end of document and stop parsing. returns formula"""
+        self._store.endDoc(self._formula)  # don't canonicalize yet
+        return self._formula
 
-    def makeStatement(self, triple):
-#        print "# Parser output: ", `triple`
-        self._sink.makeStatement(triple)
+    def makeStatement(self, quadruple):
+        #$$$$$$$$$$$$$$$$$$$$$
+#        print "# Parser output: ", `quadruple`
+        self._store.makeStatement(quadruple, why=self._reason2)
 
 
 
     def statement(self, str, i):
-	r = []
+        r = []
 
-	i = self.subject(str, i, r)
-	if i<0:
-	    return -1
+        i = self.object(str, i, r)  #  Allow literal for subject - extends RDF 
+        if i<0: return i
 
-	j = self.property_list(str, i, r[0])
+        j = self.property_list(str, i, r[0])
 
-	if j<0: raise BadSyntax(str, i, "expected propertylist")
-
-	return j
+        if j<0: raise BadSyntax(self._thisDoc, self.lines,
+                                    str, i, "expected propertylist")
+        return j
 
     def subject(self, str, i, res):
-	return self.node(str, i, res)
+        return self.item(str, i, res)
 
     def verb(self, str, i, res):
-	""" has _prop_
-	is _prop_ of
-	a
-	=
-	_prop_
-	>- prop ->
-	<- prop -<
-	_operator_"""
+        """ has _prop_
+        is _prop_ of
+        a
+        =
+        _prop_
+        >- prop ->
+        <- prop -<
+        _operator_"""
 
-	r = []
-	j = self.tok('has', str, i)
-	if j>=0:
-	    i = self.prop(str, j, r)
-	    if i < 0: raise BadSyntax(str, j, "expected prop")
-	    res.append(('->', r[0]))
-	    return i
-	else:
-	    j = self.tok('is', str, i)
-	    if j>=0:
-		i = self.prop(str, j, r)
-		if i < 0: raise BadSyntax(str, j, "expected prop")
-		j = self.tok('of', str, i)
-		if j<0: raise BadSyntax(str, i, "expected 'of' after prop")
-		res.append(('<-', r[0]))
-		return j
-	    else:
-		j = self.tok('a', str, i)
-		if j>=0:
-		    res.append(('->', RDF_type))
-		    return j
-		else:
-		    j = self.tok('=', str, i)
-		    if j>=0:
-			res.append(('->', DAML_equivalentTo))
-			return j
-		    else:
-			j = self.prop(str, i, r)
-			if j >= 0:
-			    res.append(('->', r[0]))
-			    return j
-			else:
-	    
-			    j = self.tok('>-', str, i)
-			    if j>=0:
-				i = self.prop(str, j, r)
-				j = self.tok('->', str, i)
-				if j<0: raise BadSyntax(str, i, "-> expected")
-				res.append(('->', r[0]))
-				return j
-			    else:
-				j = self.tok('<-', str, i)
-				if j>=0:
-				    i = self.prop(str, j, r)
-				    if i<0: raise BadSyntax(str, j, "bad verb syntax")
-				    j = self.tok('<-', str, i)
-				    if j<0: raise BadSyntax(str, i, "<- expected")
-				    res.append(('<-', r[0]))
-				    return j
-				else:
-				    return self.operator(str, i, res)
+        j = self.skipSpace(str, i)
+        if j<0:return j # eof
+        
+        r = []
+
+        j = self.tok('has', str, i)
+        if j>=0:
+            i = self.prop(str, j, r)
+            if i < 0: raise BadSyntax(self._thisDoc, self.lines,
+                                str, j, "expected property after 'has'")
+            res.append(('->', r[0]))
+            return i
+
+        j = self.tok('is', str, i)
+        if j>=0:
+            i = self.prop(str, j, r)
+            if i < 0: raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                "expected <property> after 'is'")
+            j = self.skipSpace(str, i)
+            if j<0:
+                raise BadSyntax(self._thisDoc, self.lines, str, i,
+                            "End of file found, expected property after 'is'")
+                return j # eof
+            i=j
+            j = self.tok('of', str, i)
+            if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                "expected 'of' after 'is' <prop>")
+            res.append(('<-', r[0]))
+            return j
+
+        j = self.tok('a', str, i)
+        if j>=0:
+            res.append(('->', RDF_type))
+            return j
+
+            
+        if str[i:i+2] == "<=":
+            res.append(('<-', self._store.newSymbol(Logic_NS+"implies")))
+            return i+2
+
+        if str[i:i+1] == "=":
+            if str[i+1:i+2] == ">":
+                res.append(('->', self._store.newSymbol(Logic_NS+"implies")))
+                return i+2
+            res.append(('->', DAML_sameAs))
+            return i+1
+
+        if str[i:i+2] == ":=":
+            # patch file relates two formulae, uses this    @@ really?
+            res.append(('->', Logic_NS+"becomes")) 
+            return i+2
+
+        j = self.prop(str, i, r)
+        if j >= 0:
+            res.append(('->', r[0]))
+            return j
+
+        if str[i:i+2] == ">-" or str[i:i+2] == "<-":
+            raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                        ">- ... -> syntax is obsolete.")
+
+        return -1
 
     def prop(self, str, i, res):
-	return self.node(str, i, res)
+        return self.item(str, i, res)
 
-    def node(self, str, i, res):
-	j = self.uri_ref2(str, i, res)
-	if j >= 0:
-	    return j
-	else:
-	    j = self.tok('[', str, i)
-	    if j>=0:
-                subj = ANONYMOUS , self._genPrefix + `self._nextId`
-                self._nextId = self._nextId + 1  # intern
-                i = self.property_list(str, j, subj)
-                if i<0: raise BadSyntax(str, j, "property_list expected")
-                j = self.tok(']', str, i)
-                if j<0: raise BadSyntax(str, i, "']' expected")
-                res.append(subj)
+    def item(self, str, i, res):
+        return self.path(str, i, res)
+
+    def blankNode(self, uri=None):
+        if "B" not in self._flags:
+            return self._context.newBlankNode(uri, why=self._reason2)
+        x = self._context.newSymbol(uri)
+        self._context.declareExistential(x)
+        return x
+        
+    def path(self, str, i, res):
+        """Parse the path production.
+        """
+        j = self.nodeOrLiteral(str, i, res)
+        if j<0: return j  # nope
+
+        while str[j:j+1] in "!^.":  # no spaces, must follow exactly (?)
+            ch = str[j:j+1]     # @@ Allow "." followed IMMEDIATELY by a node.
+            if ch == ".":
+                ahead = str[j+1:j+2]
+                if not ahead or (ahead in _notNameChars
+                            and ahead not in ":?<[{("): break
+            subj = res.pop()
+            obj = self.blankNode(uri=self.here(j))
+            j = self.node(str, j+1, res)
+            if j<0: raise BadSyntax(self._thisDoc, self.lines, str, j,
+                            "EOF found in middle of path syntax")
+            pred = res.pop()
+            if ch == "^": # Reverse traverse
+                self.makeStatement((self._context, pred, obj, subj)) 
+            else:
+                self.makeStatement((self._context, pred, subj, obj)) 
+            res.append(obj)
+        return j
+
+    def anonymousNode(self, ln):
+        """Remember or generate a term for one of these _: anonymous nodes"""
+        term = self._anonymousNodes.get(ln, None)
+        if term != None: return term
+        term = self._store.newBlankNode(self._context, why=self._reason2)
+        self._anonymousNodes[ln] = term
+        return term
+
+    def node(self, str, i, res, subjectAlready=None):
+        """Parse the <node> production.
+        Space is now skipped once at the beginning
+        instead of in multipe calls to self.skipSpace().
+        """
+        subj = subjectAlready
+
+        j = self.skipSpace(str,i)
+        if j<0: return j #eof
+        i=j
+        ch = str[i:i+1]  # Quick 1-character checks first:
+
+        if ch == "[":
+            bnodeID = self.here(i)
+            j=self.skipSpace(str,i+1)
+            if j<0: raise BadSyntax(self._thisDoc,
+                                    self.lines, str, i, "EOF after '['")
+            if str[j:j+1] == "=":     # Hack for "is"  binding name to anon node
+                i = j+1
+                objs = []
+                j = self.objectList(str, i, objs);
+                if j>=0:
+                    subj = objs[0]
+                    if len(objs)>1:
+                        for obj in objs:
+                            self.makeStatement((self._context,
+                                                DAML_sameAs, subj, obj))
+                    j = self.skipSpace(str, j)
+                    if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                        "EOF when objectList expected after [ = ")
+                    if str[j:j+1] == ";":
+                        j=j+1
+                else:
+                    raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                        "objectList expected after [= ")
+
+            if subj is None:
+                subj=self.blankNode(uri= bnodeID)
+
+            i = self.property_list(str, j, subj)
+            if i<0: raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                "property_list expected")
+
+            j = self.skipSpace(str, i)
+            if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                "EOF when ']' expected after [ <propertyList>")
+            if str[j:j+1] != "]":
+                raise BadSyntax(self._thisDoc,
+                                    self.lines, str, j, "']' expected")
+            res.append(subj)
+            return j+1
+
+        if ch == "{":
+            ch2 = str[i+1:i+2]
+            if ch2 == '$':
+                i += 1
+                j = i + 1
+                List = []
+                first_run = True
+                while 1:
+                    i = self.skipSpace(str, j)
+                    if i<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                                    "needed '$}', found end.")                    
+                    if str[i:i+2] == '$}':
+                        j = i+2
+                        break
+
+                    if not first_run:
+                        if str[i:i+1] == ',':
+                            i+=1
+                        else:
+                            raise BadSyntax(self._thisDoc, self.lines,
+                                                str, i, "expected: ','")
+                    else: first_run = False
+                    
+                    item = []
+                    j = self.item(str,i, item) #@@@@@ should be path, was object
+                    if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                            "expected item in set or '$}'")
+                    List.append(self._store.intern(item[0]))
+                res.append(self._store.newSet(List, self._context))
                 return j
-
-	    j = self.tok('{', str, i)
-	    if j>=0:
-                oldContext = self.context
-                subj = ANONYMOUS , self._genPrefix + `self._nextId`
-                self._nextId = self._nextId + 1  # intern
-                self.context = subj
+            else:
+                j=i+1
+                oldParentContext = self._parentContext
+                self._parentContext = self._context
+                parentAnonymousNodes = self._anonymousNodes
+                grandParentVariables = self._parentVariables
+                self._parentVariables = self._variables
+                self._anonymousNodes = {}
+                self._variables = self._variables.copy()
+                reason2 = self._reason2
+                self._reason2 = becauseSubexpression
+                if subj is None: subj = self._store.newFormula()
+                self._context = subj
                 
                 while 1:
                     i = self.skipSpace(str, j)
-                    if i<0: raise BadSyntax(str, i, "needed '}', found end.")
+                    if i<0: raise BadSyntax(self._thisDoc, self.lines,
+                                    str, i, "needed '}', found end.")
                     
-                    j = self.tok('}', str,i)
-                    if j >=0: break
+                    if str[i:i+1] == "}":
+                        j = i+1
+                        break
                     
                     j = self.directiveOrStatement(str,i)
-                    if j<0: raise BadSyntax(str, i, "expected statement or '}'")
+                    if j<0: raise BadSyntax(self._thisDoc, self.lines,
+                                    str, i, "expected statement or '}'")
 
-                self.context = oldContext # restore
-                res.append(subj)
+                self._anonymousNodes = parentAnonymousNodes
+                self._variables = self._parentVariables
+                self._parentVariables = grandParentVariables
+                self._context = self._parentContext
+                self._reason2 = reason2
+                self._parentContext = oldParentContext
+                res.append(subj.close())   #  No use until closed
                 return j
 
-            return -1
+        if ch == "(":
+            thing_type = self._store.newList
+            ch2 = str[i+1:i+2]
+            if ch2 == '$':
+                thing_type = self._store.newSet
+                i += 1
+            j=i+1
+
+            List = []
+            while 1:
+                i = self.skipSpace(str, j)
+                if i<0: raise BadSyntax(self._thisDoc, self.lines,
+                                    str, i, "needed ')', found end.")                    
+                if str[i:i+2] == '$)':
+                    j = i+2
+                    break
+                if str[i:i+1] == ')':
+                    j = i+1
+                    break
+
+                item = []
+                j = self.item(str,i, item) #@@@@@ should be path, was object
+                if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                        "expected item in list or ')'")
+                List.append(self._store.intern(item[0]))
+            res.append(thing_type(List, self._context))
+            return j
+
+        j = self.tok('this', str, i)   # This context
+        if j>=0:
+            warn(''.__class__(BadSyntax(self._thisDoc, self.lines, str, i,
+                "Keyword 'this' was ancient N3. Now use @forSome and @forAll keywords.")))
+            res.append(self._context)
+            return j
+
+        #booleans
+        j = self.tok('true', str, i)
+        if j>=0:
+            res.append(True)
+            return j
+        j = self.tok('false', str, i)
+        if j>=0:
+            res.append(False)
+            return j
+
+        if subj is None:   # If this can be a named node, then check for a name.
+            j = self.uri_ref2(str, i, res)
+            if j >= 0:
+                return j
+
+        return -1
         
     def property_list(self, str, i, subj):
-	while 1:
-	    v = []
-	    j = self.verb(str, i, v)
-	    if j<=0:
-		return i # void
-	    else:
-		objs = []
-		i = self.object_list(str, j, objs)
-		if i<0: raise BadSyntax(str, j, "object_list expected")
-		for obj in objs:
-		    dir, sym = v[0]
-		    if dir == '->':
-			self.makeStatement((self._context, sym, subj, obj))
-		    else:
-			self.makeStatement((self._context, sym, obj, subj))
+        """Parse property list
+        Leaves the terminating punctuation in the buffer
+        """
+        while 1:
+            j = self.skipSpace(str, i)
+            if j<0:
+                raise BadSyntax(self._thisDoc, self.lines, str, i,
+                            "EOF found when expected verb in property list")
+                return j #eof
 
-		j = self.tok(';', str, i)
-		if j<0:
-		    return i
-		i = j
+            if str[j:j+2] ==":-":
+                i = j + 2
+                res = []
+                j = self.node(str, i, res, subj)
+                if j<0: raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                        "bad {} or () or [] node after :- ")
+                i=j
+                continue
+            i=j
+            v = []
+            j = self.verb(str, i, v)
+            if j<=0:
+                return i # void but valid
 
-    def object_list(self, str, i, res):
-	i = self.object(str, i, res)
-	if i<0: return -1
-	while 1:
-	    j = self.tok(',', str, i)
-	    if j<0: return i    # Found something else!
-            i = self.object(str, j, res)
+            objs = []
+            i = self.objectList(str, j, objs)
+            if i<0: raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                                        "objectList expected")
+            for obj in objs:
+                dir, sym = v[0]
+                if dir == '->':
+                    self.makeStatement((self._context, sym, subj, obj))
+                else:
+                    self.makeStatement((self._context, sym, obj, subj))
+
+            j = self.skipSpace(str, i)
+            if j<0:
+                raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                                "EOF found in list of objects")
+                return j #eof
+            if str[i:i+1] != ";":
+                return i
+            i = i+1 # skip semicolon and continue
+
+    def commaSeparatedList(self, str, j, res, what):
+        """return value: -1 bad syntax; >1 new position in str
+        res has things found appended
+        """
+        i = self.skipSpace(str, j)
+        if i<0:
+            raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                    "EOF found expecting comma sep list")
+            return i
+        if str[i] == ".": return j  # empty list is OK
+        i = what(str, i, res)
+        if i<0: return -1
+        
+        while 1:
+            j = self.skipSpace(str, i)
+            if j<0: return j # eof
+            ch = str[j:j+1]  
+            if ch != ",":
+                if ch != ".":
+                    return -1
+                return j    # Found  but not swallowed "."
+            i = what(str, j+1, res)
+            if i<0:
+                raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                                "bad list content")
+                return i
+
+    def objectList(self, str, i, res):
+        i = self.object(str, i, res)
+        if i<0: return -1
+        while 1:
+            j = self.skipSpace(str, i)
+            if j<0:
+                raise BadSyntax(self._thisDoc, self.lines, str, j,
+                                    "EOF found after object")
+                return j #eof
+            if str[j:j+1] != ",":
+                return j    # Found something else!
+            i = self.object(str, j+1, res)
+            if i<0: return i
 
     def checkDot(self, str, i):
-            j = self.tok('.', str, i)
-            if j >=0: return j
-            
-            j = self.tok('}', str, i)
-            if j>=0: return i # Can omit . before these
-            j = self.tok(']', str, i)
-            if j>=0: return i # Can omit . before these
-
-            print "# N3: expected '.' in %s^%s" %(str[i-30:i], str[i:i+30])
+            j = self.skipSpace(str, i)
+            if j<0: return j #eof
+            if str[j:j+1] == ".":
+                return j+1  # skip
+            if str[j:j+1] == "}":
+                return j     # don't skip it
+            if str[j:j+1] == "]":
+                return j
+            raise BadSyntax(self._thisDoc, self.lines,
+                    str, j, "expected '.' or '}' or ']' at end of statement")
             return i
 
 
     def uri_ref2(self, str, i, res):
-	#hmm... intern the resulting symbol?
-	qn = []
-	j = self.qname(str, i, qn)
-	if j>=0:
-	    pfx, ln = qn[0]
-	    if pfx is None:
-		ns = self._thisDoc
-	    else:
-		try:
-		    ns = self._bindings[pfx]
-		except KeyError:
-		    raise BadSyntax(str, i, "prefix not bound")
-#	    res.append(internFrag(ns, ln))
-            res.append( RESOURCE, ns+ "#" + ln)
-	    return j
+        """Generate uri from n3 representation.
 
-        v = []
-        j = self.variable(str,i,v)
-        if j>0:
-#            res.append(internVariable(self._thisDoc,v[0]))
-            res.append(VARIABLE, v[0])
+        Note that the RDF convention of directly concatenating
+        NS and local name is now used though I prefer inserting a '#'
+        to make the namesapces look more like what XML folks expect.
+        """
+        qn = []
+        j = self.qname(str, i, qn)
+        if j>=0:
+            pfx, ln = qn[0]
+            if pfx is None:
+                assert 0, "not used?"
+                ns = self._baseURI + ADDED_HASH
+            else:
+                try:
+                    ns = self._bindings[pfx]
+                except KeyError:
+                    if pfx == "_":  # Magic prefix 2001/05/30, can be overridden
+                        res.append(self.anonymousNode(ln))
+                        return j
+                    raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                "Prefix \"%s:\" not bound" % (pfx))
+            symb = self._store.newSymbol(ns + ln)
+            if symb in self._variables:
+                res.append(self._variables[symb])
+            else:
+                res.append(symb) # @@@ "#" CONVENTION
+            if not string.find(ns, "#"):progress(
+                        "Warning: no # on namespace %s," % ns)
             return j
-        
-        j = self.skipSpace(str, i)
-        if j<0: return -1
-        else: i=j
 
-        if str[i]=="<":
+        
+        i = self.skipSpace(str, i)
+        if i<0: return -1
+
+        if str[i] == "?":
+            v = []
+            j = self.variable(str,i,v)
+            if j>0:              #Forget varibles as a class, only in context.
+                res.append(v[0])
+                return j
+            return -1
+
+        elif str[i]=="<":
             i = i + 1
             st = i
             while i < len(str):
                 if str[i] == ">":
                     uref = str[st:i] # the join should dealt with "":
-                    uref = urlparse.urljoin(self._baseURI, str[st:i])
-                    res.append(RESOURCE , uref)
+                    if self._baseURI:
+                        uref = uripath.join(self._baseURI, uref)
+                    else:
+                        assert ":" in uref, \
+                            "With no base URI, cannot deal with relative URIs"
+                    if str[i-1:i]=="#" and not uref[-1:]=="#":
+                        uref = uref + "#" # She meant it! Weirdness in urlparse?
+                    symb = self._store.newSymbol(uref)
+                    if symb in self._variables:
+                        res.append(self._variables[symb])
+                    else:
+                        res.append(symb)
                     return i+1
                 i = i + 1
-            raise BadSyntax(str, j, "unterminated URI reference")
+            raise BadSyntax(self._thisDoc, self.lines, str, j,
+                            "unterminated URI reference")
+
+        elif self.keywordsSet:
+            v = []
+            j = self.bareWord(str,i,v)
+            if j<0: return -1      #Forget varibles as a class, only in context.
+            if v[0] in self.keywords:
+                raise BadSyntax(self._thisDoc, self.lines, str, i,
+                    'Keyword "%s" not allowed here.' % v[0])
+            res.append(self._store.newSymbol(self._bindings[""]+v[0]))
+            return j
         else:
             return -1
 
     def skipSpace(self, str, i):
-	while 1:
-            while i<len(str) and str[i] in string.whitespace:
-                i = i + 1
-            if i == len(str): return -1
-            if str[i] == N3CommentCharacter:     # "#"?
-                while i<len(str) and str[i] != "\n":
-                    i = i + 1
-            else: break
-	return i
+        """Skip white space, newlines and comments.
+        return -1 if EOF, else position of first non-ws character"""
+        while 1:
+            m = eol.match(str, i)
+            if m == None: break
+            self.lines = self.lines + 1
+            i = m.end()   # Point to first character unmatched
+            self.startOfLine = i
+        m = ws.match(str, i)
+        if m != None:
+            i = m.end()
+        m = eof.match(str, i)
+        if m != None: return -1
+        return i
 
     def variable(self, str, i, res):
-	"""	?abc -> 'abc'
-  	"""
+        """     ?abc -> variable(:abc)
+        """
 
-	j = self.skipSpace(str, i)
-	if j<0: return -1
+        j = self.skipSpace(str, i)
+        if j<0: return -1
 
         if str[j:j+1] != "?": return -1
         j=j+1
         i = j
-	while i <len(str) and str[i] in self._namechars:
+        if str[j] in "0123456789-":
+            raise BadSyntax(self._thisDoc, self.lines, str, j,
+                            "Varible name can't start with '%s'" % str[j])
+            return -1
+        while i <len(str) and str[i] not in _notNameChars:
             i = i+1
-        res.append( self.varPrefix + str[j:i])
-#        print "Variable found: <<%s>>" % str[j:i]
+        if self._parentContext == None:
+            raise BadSyntax(self._thisDoc, self.lines, str, j,
+                "Can't use ?xxx syntax for variable in outermost level: %s"
+                % str[j-1:i])
+        varURI = self._store.newSymbol(self._baseURI + "#" +str[j:i])
+        if varURI not in self._parentVariables:
+            self._parentVariables[varURI] = self._parentContext.newUniversal(varURI
+                            , why=self._reason2) 
+        res.append(self._parentVariables[varURI])
+        return i
+
+    def bareWord(self, str, i, res):
+        """     abc -> :abc
+        """
+        j = self.skipSpace(str, i)
+        if j<0: return -1
+
+        if str[j] in "0123456789-" or str[j] in _notNameChars: return -1
+        i = j
+        while i <len(str) and str[i] not in _notNameChars:
+            i = i+1
+        res.append(str[j:i])
         return i
 
     def qname(self, str, i, res):
-	"""
-	xyz:def -> ('xyz', 'def')
-	def -> ('', 'def')                   @@@@
-	:def -> ('', 'def')    
-	"""
+        """
+        xyz:def -> ('xyz', 'def')
+        If not in keywords and keywordsSet: def -> ('', 'def')
+        :def -> ('', 'def')    
+        """
 
-	j = self.skipSpace(str, i)
-	if j<0: return -1
-	else: i=j
+        i = self.skipSpace(str, i)
+        if i<0: return -1
 
-	c = str[i]
-	if c in self._namechars:
-	    ln = c
-	    i = i + 1
-	    while i < len(str):
-		c = str[i]
-		if c in self._namechars:
-		    ln = ln + c
-		    i = i + 1
-		else: break
-	else:
+        c = str[i]
+        if c in "0123456789-+": return -1
+        if c not in _notNameChars:
+            ln = c
+            i = i + 1
+            while i < len(str):
+                c = str[i]
+                if c not in _notNameChars:
+                    ln = ln + c
+                    i = i + 1
+                else: break
+        else: # First character is non-alpha
             ln = ''   # Was:  None - TBL (why? useful?)
 
-	if i<len(str) and str[i] == ':':
-	    pfx = ln
-	    i = i + 1
-	    ln = ''
-	    while i < len(str):
-		c = str[i]
-		if c in self._namechars:
-		    ln = ln + c
-		    i = i + 1
-		else: break
+        if i<len(str) and str[i] == ':':
+            pfx = ln
+            i = i + 1
+            ln = ''
+            while i < len(str):
+                c = str[i]
+                if c not in _notNameChars:
+                    ln = ln + c
+                    i = i + 1
+                else: break
 
-	    res.append((pfx, ln))
-	    return i
+            res.append((pfx, ln))
+            return i
 
-	else:
-	    if ln:
-		res.append(('', ln))
-		return i
-	    else:
-		return -1
-	    
+        else:  # delimiter was not ":"
+            if ln and self.keywordsSet and ln not in self.keywords:
+                res.append(('', ln))
+                return i
+            return -1
+            
     def object(self, str, i, res):
-	j = self.subject(str, i, res)
-	if j>= 0:
-	    return j
-	else:
-	    j = self.skipSpace(str, i)
-	    if j<0: return -1
-	    else: i=j
+        j = self.subject(str, i, res)
+        if j>= 0:
+            return j
+        else:
+            j = self.skipSpace(str, i)
+            if j<0: return -1
+            else: i=j
 
-	    if str[i]=='"':
-		i = i + 1
-		st = i
-		while i < len(str):
-		    if str[i] == '"':
-			res.append(LITERAL, str[st:i])
-			return i+1
-		    i = i + 1
-		raise BadSyntax(str, i, "unterminated string literal")
-	    else:
-		return -1
+            if str[i]=='"':
+                if str[i:i+3] == '"""': delim = '"""'
+                else: delim = '"'
+                i = i + len(delim)
 
-    def operator(self, str, i, res):
-	j = self.tok('+', str, i)
-	if j >= 0:
-	    res.append('+') #@@ convert to operator:plus and then to URI
-	    return j
+                j, s = self.strconst(str, i, delim)
 
-	j = self.tok('-', str, i)
-	if j >= 0:
-	    res.append('-') #@@
-	    return j
+                res.append(self._store.newLiteral(s))
+                progress("New string const ", s, j)
+                return j
+            else:
+                return -1
 
-	j = self.tok('*', str, i)
-	if j >= 0:
-	    res.append('*') #@@
-	    return j
+    def nodeOrLiteral(self, str, i, res):
+        j = self.node(str, i, res)
+        if j>= 0:
+            return j
+        else:
+            j = self.skipSpace(str, i)
+            if j<0: return -1
+            else: i=j
 
-	j = self.tok('/', str, i)
-	if j >= 0:
-	    res.append('/') #@@
-	    return j
-	else:
-	    return -1
+            ch = str[i]
+            if ch in "-+0987654321":
+		m = datetime_syntax.match(str, i);
+		if m != None:
+		    j = m.end();
+		    # print "date time "+str[i:j]
+		    if 'T' in str[i:j]:
+			res.append(self._store.newLiteral(str[i:j],
+			   self._store.newSymbol(DATETIME_DATATYPE)))
+			return j
+		    else:
+			res.append(self._store.newLiteral(str[i:j],
+			   self._store.newSymbol(DATE_DATATYPE)))
+			return j
 
-class BadSyntax:
-    def __init__(self, str, i, why):
-	self._str = str
-	self._i = i
-	self._why = why
+		m = number_syntax.match(str, i)
+		if m != None:
+		    j = m.end()
+		    if m.group('exponent') != None: # includes decimal exponent
+			res.append(float(str[i:j]))
+    #                   res.append(self._store.newLiteral(str[i:j],
+    #                       self._store.newSymbol(FLOAT_DATATYPE)))
+		    elif m.group('decimal') != None:
+			res.append(Decimal(str[i:j]))
+		    else:
+			res.append(long(str[i:j]))
+    #                   res.append(self._store.newLiteral(str[i:j],
+    #                       self._store.newSymbol(INTEGER_DATATYPE)))
+		    return j
+		raise BadSyntax(self._thisDoc, self.lines, str, i,
+			    "Bad number or datetime syntax")
+
+
+            if str[i]=='"':
+                if str[i:i+3] == '"""': delim = '"""'
+                else: delim = '"'
+                i = i + len(delim)
+
+                dt = None
+                j, s = self.strconst(str, i, delim)
+                lang = None
+                if str[j:j+1] == "@":  # Language?
+                    m = langcode.match(str, j+1)
+                    if m == None:
+                        raise BadSyntax(self._thisDoc, startline, str, i,
+                        "Bad language code syntax on string literal, after @")
+                    i = m.end()
+                    lang = str[j+1:i]
+                    j = i
+                if str[j:j+2] == "^^":
+                    res2 = []
+                    j = self.uri_ref2(str, j+2, res2) # Read datatype URI
+                    dt = res2[0]
+                    if dt.uriref() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral":
+                        try:
+                            dom = XMLtoDOM('<rdf:envelope xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns">'
+                                           + s
+                                           + '</rdf:envelope>').firstChild
+                        except:
+                            raise  ValueError('s="%s"' % s)
+                        res.append(self._store.newXMLLiteral(dom))
+                        return j
+                res.append(self._store.newLiteral(s, dt, lang))
+                return j
+            else:
+                return -1
+    
+    def uriOf(self, sym):
+        if isinstance(sym, types.TupleType):
+            return sym[1] # old system for --pipe
+        return sym.uriref() # cwm api
+
+
+    def strconst(self, str, i, delim):
+        """parse an N3 string constant delimited by delim.
+        return index, val
+        """
+
+
+        j = i
+        ustr = u""   # Empty unicode string
+        startline = self.lines # Remember where for error messages
+        while j<len(str):
+            if str[j] == '"':
+                if delim == '"': # done when delim is "
+                    i = j + 1
+                    return i, ustr
+                if delim == '"""': # done when delim is """ and ...
+                    if str[j:j+5] == '"""""': # ... we have "" before
+                        i = j + 5
+                        ustr = ustr + '""'
+                        return i, ustr
+                    if str[j:j+4] == '""""': # ... we have " before
+                        i = j + 4
+                        ustr = ustr + '"'
+                        return i, ustr
+                    if str[j:j+3] == '"""': # ... current " is part of delim
+                        i = j + 3
+                        return i, ustr
+                
+                    # we are inside of the string and current char is "
+                    j = j + 1
+                    ustr = ustr + '"'
+                    continue
+            
+            m = interesting.search(str, j)  # was str[j:].
+            # Note for pos param to work, MUST be compiled  ... re bug?
+            assert m , "Quote expected in string at ^ in %s^%s" %(
+                str[j-20:j], str[j:j+20]) # we at least have to find a quote
+
+            i = m.start()
+            try:
+                ustr = ustr + str[j:i]
+            except UnicodeError:
+                err = ""
+                for c in str[j:i]:
+                    err = err + (" %02x" % ord(c))
+                streason = sys.exc_info()[1].__str__()
+                raise BadSyntax(self._thisDoc, startline, str, j,
+                "Unicode error appending characters %s to string, because\n\t%s"
+                                % (err, streason))
+                
+#           print "@@@ i = ",i, " j=",j, "m.end=", m.end()
+
+            ch = str[i]
+            if ch == '"':
+                j = i
+                continue
+            elif ch == "\r":   # Strip carriage returns
+                j = i+1
+                continue
+            elif ch == "\n":
+                if delim == '"':
+                    raise BadSyntax(self._thisDoc, startline, str, i,
+                                    "newline found in string literal")
+                self.lines = self.lines + 1
+                ustr = ustr + ch
+                j = i + 1
+                self.startOfLine = j
+
+            elif ch == "\\":
+                j = i + 1
+                ch = str[j:j+1]  # Will be empty if string ends
+                if not ch:
+                    raise BadSyntax(self._thisDoc, startline, str, i,
+                                    "unterminated string literal (2)")
+                k = string.find('abfrtvn\\"', ch)
+                if k >= 0:
+                    uch = '\a\b\f\r\t\v\n\\"'[k]
+                    ustr = ustr + uch
+                    j = j + 1
+                elif ch == "u":
+                    j, ch = self.uEscape(str, j+1, startline)
+                    ustr = ustr + ch
+                elif ch == "U":
+                    j, ch = self.UEscape(str, j+1, startline)
+                    ustr = ustr + ch
+                else:
+                    raise BadSyntax(self._thisDoc, self.lines, str, i,
+                                    "bad escape")
+
+        raise BadSyntax(self._thisDoc, self.lines, str, i,
+                        "unterminated string literal")
+
+
+    def uEscape(self, str, i, startline):
+        j = i
+        count = 0
+        value = 0
+        while count < 4:  # Get 4 more characters
+            ch = str[j:j+1].lower() 
+                # sbp http://ilrt.org/discovery/chatlogs/rdfig/2002-07-05
+            j = j + 1
+            if ch == "":
+                raise BadSyntax(self._thisDoc, startline, str, i,
+                                "unterminated string literal(3)")
+            k = string.find("0123456789abcdef", ch)
+            if k < 0:
+                raise BadSyntax(self._thisDoc, startline, str, i,
+                                "bad string literal hex escape")
+            value = value * 16 + k
+            count = count + 1
+        uch = unichr(value)
+        return j, uch
+
+    def UEscape(self, str, i, startline):
+        stringType = type('')
+        j = i
+        count = 0
+        value = '\\U'
+        while count < 8:  # Get 8 more characters
+            ch = str[j:j+1].lower() 
+            # sbp http://ilrt.org/discovery/chatlogs/rdfig/2002-07-05
+            j = j + 1
+            if ch == "":
+                raise BadSyntax(self._thisDoc, startline, str, i,
+                                "unterminated string literal(3)")
+            k = string.find("0123456789abcdef", ch)
+            if k < 0:
+                raise BadSyntax(self._thisDoc, startline, str, i,
+                                "bad string literal hex escape")
+            value = value + ch
+            count = count + 1
+            
+        uch = stringType(value).decode('unicode-escape')
+        return j, uch
+
+wide_build = True
+try:
+    unichr(0x10000)
+except ValueError:
+    wide_build = False
+
+# If we are going to do operators then they should generate
+#  [  is  operator:plus  of (  \1  \2 ) ]
+
+
+class BadSyntax(SyntaxError):
+    def __init__(self, uri, lines, str, i, why):
+        self._str = str.encode('utf-8') # Better go back to strings for errors
+        self._i = i
+        self._why = why
+        self.lines = lines
+        self._uri = uri 
 
     def __str__(self):
-	str = self._str
-	i = self._i
+        str = self._str
+        i = self._i
+        st = 0
+        if i>60:
+            pre="..."
+            st = i - 60
+        else: pre=""
+        if len(str)-i > 60: post="..."
+        else: post=""
 
-	if i>30: pre="..."
-	else: pre=""
-	if len(str)-i > 30: post="..."
-	else: post=""
-
-	return 'bad syntax (%s) at: "%s%s^%s%s"' \
-	       % (self._why, pre, str[i-30:i], str[i:i+30], post)
-
-
-
-
-
+        return 'at line %i of <%s>:\nBad syntax (%s) at ^ in:\n"%s%s^%s%s"' \
+               % (self.lines +1, self._uri, self._why, pre,
+                                    str[st:i], str[i:i+60], post)
 
 
 
+def stripCR(str):
+    res = ""
+    for ch in str:
+        if ch != "\r":
+            res = res + ch
+    return res
 
-########################################################  URI Handling
-#
-#  In general an RDf resource - here a Thing, has a uriRef rather
-# than just a URI.  It has subclasses of Resource and Fragment.
-# (libwww equivalent HTParentAnchor and HTChildAnchor IIRC)
-#
-# Every resource has a symbol table of fragments.
-# A resource may (later) have a connection to a bunch of parsed stuff.
-#
-# We are nesting symbols two deep let's make a symbol table for each resource
-#
-#  The statement store lists are to reduce the search time
-# for triples in some cases. Of course, indexes would be faster.
-# but we can figure out what to optimize later.  The target for now
-# is being able to find synonyms and so translate documents.
+def dummyWrite(x):
+    pass
 
-        
-class Thing:
-    def __init__(self):
-      self.occursAs = [], [], [], []  #  List of statements in store by part of speech       
-            
-    def __repr__(self):   # only used for debugging I think
-        return self.representation()
+################################################################################
 
-    def representation(self, base=None):
-        """ in N3 """
-        return "<" + self.uriref(base) + ">"
 
-    def generated(self):
-        """  Is this thing a genid - is its name arbitrary? """
-        return 0    # unless overridden
-
-    def n3_anonymous(self, context):
-        """ Can be output as an anonymous node in N3
-        """
-        return (self.generated() and  # The URI is irrelevant
-            self.occurrences(OBJ,context) == 1 and  # This is only incoming arrow
-            self.occurrences(PRED, context) == 0 )    # It is not used as a verb itself
-
-    def asPair(self):
-        return (RESOURCE, self.uriref(None))
+def toBool(s):
+    if s == 'true' or s == 'True' or s == '1':
+        return True
+    if s == 'false' or s == 'False' or s == '0':
+        return False
+    raise ValueError(s)
     
-    def occurrences(self, p, context):
-        """ Count the times a thing occurs in a statement in given context
-        """
-        if context == None:   # meaning any
-            return len(self.occursAs[p])
-        else:
-            n = 0
-            for s in self.occursAs[p]:
-                if s.triple[CONTEXT] is context:
-                    n = n+1
-            return n
-
-class Resource(Thing):
-    """   A Thing which has no fragment
-    """
+class ToN3(RDFSink.RDFSink):
+    """Serializer output sink for N3
     
-    def __init__(self, uri):
-        Thing.__init__(self)
-        self.uri = uri
-        self.fragments = {}
-
-    def uriref(self, base):
-        if base is self :  # @@@@@@@ Really should generate relative URI!
-            return ""
-        else:
-            return self.uri
-
-    def internFrag(r,fragid):
-            f = r.fragments.get(fragid, None)
-            if f: return f
-            f = Fragment(r, fragid)
-            r.fragments[fragid] = f
-            return f
-                
-    def internAnonymous(r, fragid):
-            f = r.fragments.get(fragid, None)
-            if f: return f
-            f = Anonymous(r, fragid)
-            r.fragments[fragid] = f
-            return f
-                
-    def internVariable(r, fragid):
-            f = r.fragments.get(fragid, None)
-            if f: return f
-            f = Variable(r, fragid)
-            r.fragments[fragid] = f
-            return f
-                
-    
-class Fragment(Thing):
-    """    A Thing which DOES have a fragment id in its URI
-    """
-    def __init__(self, resource, fragid):
-        Thing.__init__(self)
-
-        self.resource = resource
-        self.fragid = fragid
-
-    def uriref(self, base):
-        return self.resource.uriref(base) + "#" + self.fragid
-
-    def representation(self,  base=None):
-        """ Optimize output if prefixes available
-        """
-        return  "<" + self.uriref(base) + ">"
-
-    def generated(self):
-         """ A generated identifier?
-         This arises when a document is parsed and a arbitrary
-         name is made up to represent a node with no known URI.
-         It is useful to know that its ID has no use outside that
-         context.
-         """
-         return self.fragid[0] == "_"  # Convention for now @@@@@
-                                # parser should use seperate class?
-
-
-class Anonymous(Fragment):
-    def __init__(self, resource, fragid):
-        Fragment.__init__(self, resource, fragid)
-
-    def generated(self):
-        return 1
-
-    def asPair(self):
-        return (ANONYMOUS, self.uriref(None))
-        
-class Variable(Fragment):
-    def __init__(self, resource, fragid):
-        Fragment.__init__(self, resource, fragid)
-
-    def asPair(self):
-        return (VARIABLE, self.uriref(None))
-        
-class Literal(Thing):
-    """ A Literal is a data resource to make it clean
-
-    really, data:application/n3;%22hello%22 == "hello" but who
-    wants to store it that way?  Maybe we do... at least in theory and maybe
-    practice but, for now, we keep them in separate subclases of Thing.
-    """
-    Literal_URI_Prefix = "data:application/n3;"
-
-    def __init__(self, string):
-        Thing.__init__(self)
-        self.string = string    #  n3 notation EXcluding the "  "
-
-    def __repr__(self):
-        return self.string
-
-    def asPair(self):
-        return (LITERAL, self.string)
-
-    def representation(self, base=None):
-        return '"' + self.string + '"'   # @@@ encode quotes; @@@@ strings containing \n
-
-    def uriref(self, base=None):      # Unused at present but interesting! 2000/10/14
-        return  Literal_URI_Prefix + uri_encode(self.representation())
-
-def uri_encode(str):
-        """ untested - this must be in a standard library somewhere
-        """
-        result = ""
-        i=0
-        while i<len(str) :
-            if string.find('"\'><"', str[i]) <0 :   # @@@ etc
-                result.append("%%%2x" % (atoi(str[i])))
-            else:
-                result.append(str[i])
-        return result
-
-####################################### Engine
-    
-class Engine:
-    """ The root of the references in the system -a set of things and stores
+      keeps track of most recent subject and predicate reuses them.
+      Adapted from Dan's ToRDFParser(Parser);
     """
 
-    def __init__(self):
-        self.resources = {}    # Hash table of URIs for interning things
+    flagDocumentation = """Flags for N3 output are as follows:-
         
-        
-    def intern(self, pair):
-        """  Returns either a Fragment or a Resource as appropriate
+a   Anonymous nodes should be output using the _: convention (p flag or not).
+d   Don't use default namespace (empty prefix)
+c   Comments added at top about version and base URI used.
+e   escape literals --- use \u notation
+g   Suppress => shothand for log:implies
+i   Use identifiers from store - don't regen on output
+l   List syntax suppression. Don't use (..)
+n   No numeric syntax - use strings typed with ^^ syntax
+p   Prefix suppression - don't use them, always URIs in <> instead of qnames.
+r   Relative URI suppression. Always use absolute URIs.
+s   Subject must be explicit for every statement. Don't use ";" shorthand.
+t   "=" and "()" special syntax should be suppresed.
+u   Use \u for unicode escaping in URIs instead of utf-8 %XX
+v   Use  "this log:forAll" for @forAll, and "this log:forAll" for "@forSome".
+/   If namespace has no # in it, assume it ends at the last slash if outputting.
 
-    This is the way they are actually made.
-    """
-        type, uriref = pair
-        if type == LITERAL:
-            return Literal(uriref)  # No interning for literals (?@@?)
+Flags for N3 input:
 
-#        print " ... interning <%s>" % `uriref`
-        hash = len(uriref)-1
-        while (hash >= 0) and not (uriref[hash] == "#"):
-            hash = hash-1
-        if hash < 0 :     # This is a resource with no fragment
-            r = self.resources.get(uriref, None)
-            if r: return r
-            r = Resource(uriref)
-            self.resources[uriref] = r
-            return r
-        
-        else :      # This has a fragment and a resource
-            r = self.intern((RESOURCE, uriref[:hash]))
-            if type == RESOURCE:  return r.internFrag(uriref[hash+1:])
-            if type == ANONYMOUS: return r.internAnonymous(uriref[hash+1:])
-            if type == VARIBALE:  return r.internVariable(uriref[hash+1:])
-
-
-######################################################### Tests
-  
-def test():
-    import sys
-    testString = []
-    
-    t0 = """bind x: <http://example.org/x-ns/> .
-	    bind dc: <http://purl.org/dc/elements/1.1/> ."""
-
-    t1="""[ >- x:firstname -> "Ora" ] >- dc:wrote ->
-    [ >- dc:title -> "Moby Dick" ] .
-     bind default <http://example.org/default>.
-     <uriPath> :localProp defaultedName .
-     
+B   Turn any blank node into a existentially qualified explicitly named node.
 """
-    t2="""
-[ >- x:type -> x:Receipt;
-  >- x:number -> "5382183";
-  >- x:for -> [ >- x:USD -> "2690" ];
-  >- x:instrument -> [ >- x:type -> x:visa ] ]
-
->- x:inReplyTo ->
-
-[ >- x:type -> x:jobOrder;
-  >- x:number -> "025709";
- >- x:from ->
-
- [
-  >- x:homePage -> <http://www.topnotchheatingandair.com/>;
-  >- x:est -> "1974";
-  >- x:address -> [ >- x:street -> "23754 W. 82nd Terr.";
-      >- x:city -> "Lenexa";
-      >- x:state -> "KS";
-      >- x:zip -> "66227"];
-  >- x:phoneMain -> <tel:+1-913-441-8900>;
-  >- x:fax -> <tel:+1-913-441-8118>;
-  >- x:mailbox -> <mailto:info@topnotchheatingandair.com> ]
-].    
-
-<http://www.davelennox.com/residential/furnaces/re_furnaces_content_body_elite90gas.asp>
- >- x:describes -> [ >- x:type -> x:furnace;
- >- x:brand -> "Lennox";
- >- x:model -> "G26Q3-75"
- ].
-"""
-    t3="""
-bind pp: <http://example.org/payPalStuff?>.
-bind default <http://example.org/payPalStuff?>.
-
-<> a pp:Check; pp:payee :tim; pp:amount "$10.00";
-  dc:author :dan; dc:date "2000/10/7" ;
-  is pp:part of [ a pp:Transaction; = :t1 ] .
-"""
-
-# Janet's chart:
-    t4="""
-bind q: <http://example.org/>.
-bind m: <>.
-bind n: <http://example.org/base/>.
-bind : <http://void-prefix.example.org/>.
-bind w3c: <http://www.w3.org/2000/10/org>.
-
-<#QA> :includes 
- [  = w3c:internal ; :includes <#TAB> , <#interoperability> ,
-     <#validation> , w3c:wai , <#i18n> , <#translation> ,
-     <#readability_elegance>, w3c:feedback_accountability ],
- [ = <#conformance>;
-     :includes <#products>, <#content>, <#services> ],
- [ = <#support>; :includes
-     <#tools>, <#tutorials>, <#workshops>, <#books_materails>,
-     <#certification> ] .
-
-<#internal> q:supports <#conformance> .  
-<#support> q:supports <#conformance> .
-
-"""
-
-    t5 = """
-
-bind u: <http://www.example.org/utilities>
-bind default <>
-
-:assumption = { :fred u:knows :john .
-                :john u:knows :mary .} .
-
-:conclusion = { :fred u:knows :mary . } .
-
-"""
-    thisURI = "file:notation3.py"
-    thisDoc = thisURI
-    testString.append(  t0 + t1 + t2 + t3 + t4 )
-#    testString.append(  t5 )
-
-#    p=SinkParser(RDFSink(),'http://example.org/base/', 'file:notation3.py',
-#		     'data:#')
-
-    r=SinkParser(SinkToN3(sys.stdout.write, 'file:output'),
-                  thisURI,'http://example.org/base/',)
-    r.startDoc()
-    
-    print "=== test stringing: ===== STARTS\n ", t0, "\n========= ENDS\n"
-    r.feed(t0)
-
-    print "=== test stringing: ===== STARTS\n ", t1, "\n========= ENDS\n"
-    r.feed(t1)
-
-    print "=== test stringing: ===== STARTS\n ", t2, "\n========= ENDS\n"
-    r.feed(t2)
-
-    print "=== test stringing: ===== STARTS\n ", t3, "\n========= ENDS\n"
-    r.feed(t3)
-
-    r.endDoc()
-
-    print "----------------------- Test store:"
-
-    testEngine = Engine()
-    store = RDFStore(testEngine)
-    # (sink,  thisDoc,  baseURI, bindings)
-    p = SinkParser(store,  thisURI, 'http://example.org/base/')
-    p.startDoc()
-    p.feed(testString[0])
-    p.endDoc()
-
-    print "\n\n------------------ dumping chronologically:"
-
-    store.dumpChronological(thisDoc, SinkToN3(sys.stdout.write, thisURI))
-
-    print "\n\n---------------- dumping in subject order:"
-
-    store.dumpBySubject(thisDoc, SinkToN3(sys.stdout.write, thisURI))
-
-    print "\n\n---------------- dumping nested:"
-
-    store.dumpNested(thisDoc, SinkToN3(sys.stdout.write, thisURI))
-
-    print "Regression test **********************************************"
-
-    
-    testString.append(reformat(testString[-1], thisDoc))
-
-    if testString[-1] == testString[-2]:
-        print "\nRegression Test succeeded FIRST TIME- WEIRD!!!!??!!!!!\n"
-        return
-    
-    testString.append(reformat(testString[-1], thisDoc))
-
-    if testString[-1] == testString[-2]:
-        print "\nRegression Test succeeded SECOND time!!!!!!!!!\n"
-    else:
-        print "Regression Test Failure: ===================== LEVEL 1:"
-        print testString[1]
-        print "Regression Test Failure: ===================== LEVEL 2:"
-        print testString[2]
-        print "\n============================================= END"
-
-    testString.append(reformat(testString[-1], thisDoc))
-    if testString[-1] == testString[-2]:
-        print "\nRegression Test succeeded THIRD TIME. This is not exciting.\n"
-
-    
-                
-def reformat(str, thisDoc):
-    if 0:
-        print "Regression Test: ===================== INPUT:"
-        print str
-        print "================= ENDs"
-    buffer=StringWriter()
-    r=SinkParser(SinkToN3(buffer.write, `thisDoc`),
-                  'file:notation3.py')
-    r.startDoc()
-    r.feed(str)
-    r.endDoc()
-    return buffer.result()
-    
-
-################################################################### Sinks
-
-class RDFSink:
-
-    """  Dummy RDF sink prints calls
-
-    This is a superclass for other RDF processors which accept RDF events
-    -- maybe later Swell events.  Adapted from printParser
-    """
-#  Keeps track of prefixes
-	    
-
-    def __init__(self):
-        self.prefixes = { }     # Convention only - human friendly
-        self.namespaces = {}    # Both ways
-
-    def bind(self, prefix, ns):
-        if not self.prefixes.get(ns, None):  # If we don't have a prefix for this ns
-            if not self.namespaces.get(prefix,None):   # For conventions
-                self.prefixes[ns] = prefix
-                self.namespaces[prefix] = ns
-                if chatty: print "# RDFSink: Bound %s to %s" % (prefix, `ns`)
-            else:
-                self.bind(prefix+"g1", ns) # Recurive
-        
-    def makeStatement(self, tuple):
-        pass
-
-    def startDoc(self):
-        print "sink: start.\n"
-
-    def endDoc(self):
-        print "sink: end.\n"
-
-
-########################## RDF 1.0 Syntax generator
-	    
-class ToRDF(RDFSink):
-    """keeps track of most recent subject, reuses it"""
-
-    def __init__(self, outFp, thisURI):
-        RDFSink.__init__(self)
-	self._wr = XMLWriter(outFp)
-	self._subj = None
-	self._thisDoc = thisURI
-
-    #@@I18N
-    _namechars = string.lowercase + string.uppercase + string.digits + '_'
-    _rdfns = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
-    _myns = 'http://www.w3.org/2000/10/n3/notation3.py#'
-
-    def startDoc(self):
-	self._wr.startElement('web:RDF',
-			      (('xmlns:web', self._rdfns),
-			       ('xmlns:g', self._myns)))
-	self._subj = None
-	self._nextId = 0
-
-    def endDoc(self):
-	if self._subj:
-	    self._wr.endElement()
-	self._subj = None
-	self._wr.endElement()
-
-    def makeStatement(self,  tuple):
-        pred, subj, obj = tuple
-	predn = relativeTo(self._thisDoc, pred)
-	subjn = relativeTo(self._thisDoc, subj)
-
-	if self._subj is not subj:
-	    if self._subj:
-		self._wr.endElement()
-	    self._wr.startElement('web:Description',
-				 (('about', subjn),))
-	    self._subj = subj
-
-
-	i = len(predn)
-	while i>0:
-	    if predn[i-1] in self._namechars:
-		i = i - 1
-	    else:
-		break
-	ln = predn[i:]
-	ns = predn[:i]
-
-	if not isinstance(obj, Literal): 
-	    objn = relativeTo(self._thisDoc, obj)
-	    self._wr.emptyElement(ln,
-				 (('xmlns', ns),
-				  ('resource', objn)))
-	else:
-	    self._wr.startElement(ln,
-				 (('xmlns', ns),))
-	    self._wr.data(obj)
-	    self._wr.endElement()
-
-def relativeTo(here, there):
-    nh = `here`
-    l = len(nh)
-    nt = `there`
-    if nt[:l] == nh:
-	return nt[l:]
-    else:
-	return nt
-
-
-
-class XMLWriter:
-    """ taken from
-    Id: tsv2xml.py,v 1.1 2000/10/02 19:41:02 connolly Exp connolly
-    """
-
-    def __init__(self, outFp):
-	self._outFp = outFp
-	self._elts = []
-
-    #@@ on __del__, close all open elements?
-
-    def startElement(self, n, attrs = ()):
-	o = self._outFp
-
-	o.write("<%s" % (n,))
-
-	self._attrs(attrs)
-
-	self._elts.append(n)
-
-	o.write("\n%s>" % (' ' * (len(self._elts) * 2) ))
-
-    def _attrs(self, attrs):
-	o = self._outFp
-	for n, v in attrs:
-	    #@@BUG: need to escape markup chars in v
-	    o.write("\n%s%s=\"%s\"" \
-		    % ((' ' * (len(self._elts) * 2 + 3) ),
-		       n, v))
-
-    def emptyElement(self, n, attrs):
-	self._outFp.write("<%s" % (n,))
-	self._attrs(attrs)
-	self._outFp.write("\n%s/>" % (' ' * (len(self._elts) * 2) ))
-
-    def endElement(self):
-	n = self._elts[-1]
-	del self._elts[-1]
-	self._outFp.write("</%s\n%s>" % (n, (' ' * (len(self._elts) * 2) )))
-
-    markupChar = re.compile(r"[\n\r<>&]")
-
-    def data(self, str):
-	#@@ throw an exception if the element stack is empty
-	o = self._outFp
-
-	i = 0
-	while i < len(str):
-	    m = self.markupChar.search(str, i)
-	    if not m:
-		o.write(str[i:])
-		break
-	    j = m.start()
-	    o.write(str[i:j])
-	    o.write("&#%d;" % (ord(str[j]),))
-	    i = j + 1
+# "
 
 
 #   A word about regenerated Ids.
@@ -1092,680 +1290,790 @@ class XMLWriter:
 # document very much more readable to regenerate the IDs.
 #  We use here a convention that underscores at the start of fragment IDs
 # are reserved for generated Ids. The caller can change that.
+#
+# Now there is a new way of generating these, with the "_" prefix
+# for anonymous nodes.
 
-class SinkToN3(RDFSink):
-    """keeps track of most recent subject and predicate reuses them
+    def __init__(self, write, base=None, genPrefix = None,
+                            noLists=0 , quiet=0, flags=""):
+        gp = genPrefix
+        if gp == None:
+            gp = "#_g"
+            if base!=None: 
+                try:
+                    gp = uripath.join(base, "#_g")
+                except ValueError:
+                    pass # bogus: base eg
+        RDFSink.RDFSink.__init__(self, gp)
+        self._write = self.writeEncoded
+        self._writeRaw = write
+        self._quiet = quiet or "c" not in flags
+        self._flags = flags
+        self._subj = None
+        self.prefixes = {}      # Look up prefix conventions
+        self.defaultNamespace = None
+        self.indent = 1         # Level of nesting of output
+        self.base = base
+#       self.nextId = 0         # Regenerate Ids on output
+        self.regen = {}         # Mapping of regenerated Ids
+        self.noLists = noLists  # Suppress generation of lists?
+        self._anodeName = {} # For "a" flag
+        self._anodeId = {} # For "a" flag - reverse mapping
+        self._needNL = 0    # Do we need to have a newline before a new element?
 
-      Adapted from Dan's ToRDFParser(Parser);
-    """
+        if "l" in self._flags: self.noLists = 1
+        
+    def dummyClone(self):
+        "retun a version of myself which will only count occurrences"
+        return ToN3(write=dummyWrite, base=self.base, genPrefix=self._genPrefix,
+                    noLists=self.noLists, quiet=self._quiet, flags=self._flags )
+                    
+    def writeEncoded(self, str):
+        """Write a possibly unicode string out to the output"""
+        try:
+            return self._writeRaw(str.encode('utf-8'))
+        except UnicodeDecodeError:
+            raise UnicodeDecodeError(str, str.__class__)
 
-    def __init__(self, write, base=None, genPrefix = "#_" ):
-	self._write = write
-	self._subj = None
-	self.prefixes = {}      # Look up prefix conventions
-	self.indent = 1         # Level of nesting of output
-	self.base = base
-	self.nextId = 0         # Regenerate Ids on output
-	self.regen = {}         # Mapping of regenerated Ids
-	self.genPrefix = genPrefix  # Prefix for generated URIs on output
-	
-	#@@I18N
-    _namechars = string.lowercase + string.uppercase + string.digits + '_'
-    _rdfns = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
-    _myns = 'http://www.w3.org/2000/10/n3/notation3.py#'
-
-    def newId(self):
-        nextId = nextId + 1
-        return nextId - 1
+    def setDefaultNamespace(self, uri):
+        return self.bind("", uri)
     
-    def bind(self, prefix, ns):
+    def bind(self, prefixString, uri):
         """ Just accepting a convention here """
+        assert ':' in uri # absolute URI references only
+        if "p" in self._flags: return  # Ignore the prefix system completely
+#        if not prefixString:
+#            raise RuntimError("Please use setDefaultNamespace instead")
+        
+        if (uri == self.defaultNamespace
+            and "d" not in self._flags): return # don't duplicate ??
         self._endStatement()
-        self.prefixes[ns] = prefix
-        self._write(" bind %s: %s .\n" % (prefix, `ns`) )
+        self.prefixes[uri] = prefixString
+        if 'r' in self._flags:
+            self._write(u"@prefix %s: <%s> ."%(prefixString, uri))
+        else:
+            self._write(u"@prefix %s: <%s> ."%(prefixString, refTo(self.base, uri)))
+        self._newline()
+
+    def setDefaultNamespace(self, uri):
+        if "d" in self._flags or "p" in self._flags:
+            return  # Ignore the prefix system completely
+        self._endStatement()
+        self.defaultNamespace = uri
+        if self.base:  # Sometimes there is none, and now refTo is intolerant
+            x = refTo(self.base, uri)
+        else:
+            x = uri
+        self._write(u" @prefix : <%s> ." % x )
+        self._newline()
+       
 
     def startDoc(self):
  
-        self._write("\n#   Start notation3 generation\n")
+        if not self._quiet:  # Suppress stuff which will confuse test diffs
+            self._write(u"\n#  Notation3 generation by\n")
+            idstr = u"$Id$"
+            # CVS CHANGES THE ABOVE LINE
+            self._write(u"#       " + idstr[5:-2] + u"\n\n") 
+            # Strip "$" in case the N3 file is checked in to CVS
+            if self.base: self._write(u"#   Base was: " + self.base + u"\n")
+        self._write(u"    " * self.indent)
         self._subj = None
-        self._nextId = 0
+#        self._nextId = 0
 
-    def endDoc(self):
-	self._endStatement()
+    def endDoc(self, rootFormulaPair=None):
+        self._endStatement()
+        self._write(u"\n")
+        if self.stayOpen: return  #  fo concatenation
+        if not self._quiet: self._write(u"#ENDS\n")
+        return  # No formula returned - this is not a store
 
-    def makeStatement(self, triple):
+    def makeComment(self, str):
+        for line in string.split(str, "\n"):
+            self._write(u"#" + line + "\n")  # Newline order??@@
+        self._write(u"    " * self.indent + "    ")
+
+
+    def _newline(self, extra=0):
+        self._write(u"\n"+ u"    " * (self.indent+extra))
+
+    def makeStatement(self, triple, why=None, aIsPossible=1):
+#        triple = tuple([a.asPair() for a in triple2])
+        if ("a" in self._flags and
+            triple[PRED] == (SYMBOL, N3_forSome_URI) and
+            triple[CONTEXT] == triple[SUBJ]) :
+            # and   # We assume the output is flat @@@ true, we should not
+            try:
+                aIsPossible = aIsPossible()
+            except TypeError:
+                aIsPossible = 1
+            if aIsPossible:
+                ty, value = triple[OBJ]
+                i = len(value)
+                while i > 0 and value[i-1] not in _notNameChars+"_": i = i - 1
+                str2 = value[i:]
+                if self._anodeName.get(str2, None) != None:
+                    j = 1
+                    while 1:
+                        str3 = str2 + `j`
+                        if self._anodeName.get(str3, None) == None: break
+                        j = j +1
+                    str2 = str3
+                if str2[0] in "0123456789": str2 = "a"+str2
+                if diag.chatty_flag > 60: progress(
+                                        "Anode %s  means %s" % (str2, value)) 
+                self._anodeName[str2] = value
+                self._anodeId[value] = str2
+                return
+
         self._makeSubjPred(triple[CONTEXT], triple[SUBJ], triple[PRED])        
-        self._write(self.representationOf(triple[OBJ]))
-#        self._write(" (in %s) " % `context`)    #@@@@
+        self._write(self.representationOf(triple[CONTEXT], triple[OBJ]))
+        self._needNL = 1
+                
+# Below is for writing an anonymous node
+
+# As object, with one incoming arc:
         
-# Below is for writing an anonymous node which is the object of only one arc        
     def startAnonymous(self,  triple):
         self._makeSubjPred(triple[CONTEXT], triple[SUBJ], triple[PRED])
+        self._write(u" [")
         self.indent = self.indent + 1
-        self._write(" [ \n"+ "    " * self.indent + "    ")
-        self._subj = triple[OBJ]    # The object is now the current subject
         self._pred = None
+        self._newline()
+        self._subj = triple[OBJ]    # The object is now the current subject
 
     def endAnonymous(self, subject, verb):    # Remind me where we are
+        self._write(u" ]")
         self.indent = self.indent - 1
-        self._write(" ]")
         self._subj = subject
         self._pred = verb
 
-# Below we do anonymous top level node - arrows only leave this circle
+# As subject:
 
     def startAnonymousNode(self, subj):
-	if self._subj:
-	    self._write(" .\n")
-        self._write("\n  [ "+ "    " * self.indent)
+        if self._subj:
+            self._write(u" .")
+        self._newline()
+        self.indent = self.indent + 1
+        self._write(u"  [ ")
         self._subj = subj    # The object is not the subject context
         self._pred = None
 
-    def endAnonymousNode(self):    # Remove context
-        self._write(" ].\n")
+
+    def endAnonymousNode(self, subj=None):    # Remove default subject
+        self._write(u" ]")
+        if not subj: self._write(u".")
+        self.indent = self.indent - 1
+        self._newline()
+        self._subj = subj
+        self._pred = None
+
+# Below we print lists. A list expects to have lots of li links sent
+
+# As subject:
+
+    def startListSubject(self, subj):
+        if self._subj:
+            self._write(u" .")
+        self._newline()
+        self.indent = self.indent + 1
+        self._write(u"  ( ")
+        self._needNL = 0
+        self._subj = subj    # The object is not the subject context
+        self._pred = N3_li  # expect these until list ends
+
+
+    def endListSubject(self, subj=None):    # Remove default subject
+        self._write(u" )")
+        if not subj: self._write(u".")
+        self.indent = self.indent - 1
+        self._newline()
+        self._subj = subj
+        self._pred = None
+
+
+# As Object:
+
+    def startListObject(self,  triple):
+        self._makeSubjPred(triple[CONTEXT], triple[SUBJ], triple[PRED])
+        self._subj = triple[OBJ]
+        self._write(u" (")
+        self._needNL = 1      # Choice here of compactness
+        self.indent = self.indent + 1
+        self._pred = N3_li  # expect these until list ends
+        self._subj = triple[OBJ]    # The object is now the current subject
+
+    def endListObject(self, subject, verb):    # Remind me where we are
+        self._write(u" )")
+        self.indent = self.indent - 1
+        self._subj = subject
+        self._pred = verb
+
+
+
+# Below we print a nested formula of statements
+
+    def startFormulaSubject(self, context):
+        if self._subj != context:
+            self._endStatement()
+        self.indent = self.indent + 1
+        self._write(u"{")
+        self._newline()
         self._subj = None
         self._pred = None
 
-# Below we notate a nested bag of statements
-
-    def startBag(self, context):
-        self.indent = self.indent + 1
-        self._write(" { \n"+ "    " * self.indent + "    ")
-
-    def endBag(self, subj):    # Remove context
-        self._write(" }\n")
+    def endFormulaSubject(self, subj):    # Remove context
+        self._endStatement()     # @@@@@@@@ remove in syntax change to implicit
+        self._newline()
+        self.indent = self.indent - 1
+        self._write(u"}")
         self._subj = subj
         self._pred = None
+     
+    def startFormulaObject(self, triple):
+        self._makeSubjPred(triple[CONTEXT], triple[SUBJ], triple[PRED])
+        self.indent = self.indent + 1
+        self._write(u"{")
+        self._subj = None
+        self._pred = None
+
+    def endFormulaObject(self, pred, subj):    # Remove context
+        self._endStatement() # @@@@@@@@ remove in syntax change to implicit
         self.indent = self.indent - 1
+        self._write(u"}")
+#        self._newline()
+        self._subj = subj
+        self._pred = pred
      
     def _makeSubjPred(self, context, subj, pred):
+
+        if pred == N3_li:
+            if  self._needNL:
+                self._newline()
+            return  # If we are in list mode, don't need to.
         
-	if self._subj != subj:
-	    self._endStatement()
-	    self._write(self.representationOf(subj))
-	    self._subj = subj
-	    self._pred = None
-
-	if self._pred != pred:
-	    if self._pred:
-		  self._write(";\n" + "    " * self.indent+ "    ")
-
-            if pred == ( RESOURCE,  DAML_equivalentTo_URI ) :
-                self._write(" = ")
-            elif pred == ( RESOURCE, RDF_type_URI ) :
-                self._write(" a ")
-            else :
-#	        self._write( " >- %s -> " % self.representationOf(pred))
-                self._write( " %s " % self.representationOf(pred))
+        varDecl = (subj == context and "v" not in self._flags and (
+                pred == (SYMBOL, N3_forAll_URI) or
+                pred == (SYMBOL, N3_forSome_URI)))
                 
-	    self._pred = pred
-	else:
-	    self._write(",\n" + "    " * (self.indent+3))    # Same subject and pred => object list
+        if self._subj != subj or "s" in self._flags:
+            self._endStatement()
+            if self.indent == 1:  # Top level only - extra newline
+                self._newline()
+            if "v" in self._flags or subj != context:
+                self._write(self.representationOf(context, subj))
+            else:  # "this" suppressed
+                if (pred != (SYMBOL, N3_forAll_URI) and
+                    pred != (SYMBOL, N3_forSome_URI)):
+                    raise ValueError(
+                     "On N3 output, 'this' used with bad predicate: %s" % (pred, ))
+            self._subj = subj
+            self._pred = None
+
+        if self._pred != pred:
+            if self._pred:
+                if "v" not in self._flags and (
+                     self._pred== (SYMBOL, N3_forAll_URI) or
+                     self._pred == (SYMBOL, N3_forSome_URI)):
+                     self._write(u".")
+                else:
+                    self._write(u";")
+                self._newline(1)   # Indent predicate from subject
+            elif not varDecl: self._write(u"    ")
+
+            if varDecl:
+                    if pred == (SYMBOL, N3_forAll_URI):
+                        self._write( u" @forAll ")
+                    else:
+                        self._write( u" @forSome ")
+            elif pred == (SYMBOL, DAML_sameAs_URI) and "t" not in self._flags:
+                self._write(u" = ")
+            elif pred == (SYMBOL, LOG_implies_URI) and "g" not in self._flags:
+                self._write(u" => ")
+            elif pred == (SYMBOL, RDF_type_URI)  and "t" not in self._flags:
+                self._write(u" a ")
+            else :
+                self._write( u" %s " % self.representationOf(context, pred))
+                
+            self._pred = pred
+        else:
+            self._write(u",")
+            self._newline(3)    # Same subject and pred => object list
 
     def _endStatement(self):
         if self._subj:
-            self._write(" .\n")
-            self._write("    " * self.indent)
+            self._write(u" .")
+            self._newline()
             self._subj = None
 
-    def representationOf(self, pair):
+    def representationOf(self, context, pair):
         """  Representation of a thing in the output stream
 
-        Regenerates genids and variable names if required.
+        Regenerates genids if required.
         Uses prefix dictionary to use qname syntax if possible.
         """
 
-#        print "# Representation of ", `pair`
-        type, value = pair
-        if ((type == VARIABLE or type == ANONYMOUS)
-            and not option_noregen ):
-                i = self.regen.get(value,self.nextId)
-                if i == self.nextId:
-                    self.regen[value] = i
-                    self.nextId = self.nextId + 1
-                if type == ANONYMOUS: return "<"+self.genPrefix + "g" + `i`+">"
-                else: return "<" + self.genPrefix + "v" + `i` + ">"   # variable
+        if "t" not in self._flags:
+            if pair == context:
+                return u"this"
+            if pair == N3_nil and not self.noLists:
+                return u"()"
 
-        if type == LITERAL:
-            return '"' + value + '"'   # @@@@ encoding !!!!!!
+        ty, value = pair
+
+        singleLine = "n" in self._flags
+        if ty == LITERAL:
+            return stringToN3(value, singleLine=singleLine, flags = self._flags)
+
+        if ty == XMLLITERAL:
+            st = u''.join([Canonicalize(x, None, unsuppressedPrefixes=['foo']) for x in value.childNodes])
+            st = stringToN3(st, singleLine=singleLine, flags=self._flags)
+            return st + u"^^" + self.representationOf(context, (SYMBOL,
+                    u"http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral"))
+
+        if ty == LITERAL_DT:
+            s, dt = value
+            if "b" not in self._flags:
+                if (dt == BOOLEAN_DATATYPE):
+                    return toBool(s) and u"true" or u"false"
+            if "n" not in self._flags:
+                dt_uri = dt
+                if (dt_uri == INTEGER_DATATYPE):
+                    return unicode(long(s))
+                if (dt_uri == FLOAT_DATATYPE):
+                    retVal =  unicode(float(s))    # numeric value python-normalized
+                    if 'e' not in retVal:
+                        retVal += 'e+00'
+                    return retVal
+                if (dt_uri == DECIMAL_DATATYPE):
+                    retVal = unicode(Decimal(s))
+                    if '.' not in retVal:
+                        retVal += '.0'
+                    return retVal
+            st = stringToN3(s, singleLine= singleLine, flags=self._flags)
+            return st + u"^^" + self.representationOf(context, (SYMBOL, dt))
+
+        if ty == LITERAL_LANG:
+            s, lang = value
+            return stringToN3(s, singleLine= singleLine,
+                                        flags=self._flags)+ u"@" + lang
+
+        aid = self._anodeId.get(pair[1], None)
+        if aid != None:  # "a" flag only
+            return u"_:" + aid    # Must start with alpha as per NTriples spec.
+
+        if ((ty == ANONYMOUS)
+            and not option_noregen and "i" not in self._flags ):
+                x = self.regen.get(value, None)
+                if x == None:
+                    x = self.genId()
+                    self.regen[value] = x
+                value = x
+#                return "<"+x+">"
+
 
         j = string.rfind(value, "#")
-        if j>=0:
-            str = self.prefixes.get(value[:j], None)
-            if str != None : return str + ":" + value[j+1:]
-            if j==0: return "<#" + value[j+1:] + ">"
-                
-        return "<" + value + ">"    # Everything else
-
-    
-class StringWriter:
-
-    def __init__(self):
-        self.buffer = ""
-
-    def write(self, str):
-        self.buffer = self.buffer + str     #  No idea how to make this efficient in python
-
-    def result(self):
-        return self.buffer
-
-    def clear(self):
-        self.buffer = ""
+        if j<0:    #   and "/" in self._flags:   Always allow 2010-10-24 TimBL
+            j=string.rfind(value, "/")   # Allow "/" namespaces as a second best
         
-
-######################################################## Storage
-# The store uses an index in the actual resource objects.
-#
-#   store.occurs[context, thing][partofspeech]   dict, list, ???
-
-
-class StoredStatement:
-
-    def __init__(self, q):
-        self.triple = q
+        if (j>=0
+            and "p" not in self._flags):   # Suppress use of prefixes?
+            for ch in value[j+1:]:  #  Examples: "." ";"  we can't have in qname
+                if ch in _notNameChars:
+                    if verbosity() > 20:
+                        progress("Cannot have character %i in local name for %s"
+                                    % (ord(ch), `value`))
+                    break
+            else:
+                namesp = value[:j+1]
+                if (self.defaultNamespace
+                    and self.defaultNamespace == namesp
+                    and "d" not in self._flags):
+                    return u":"+value[j+1:]
+                self.countNamespace(namesp)
+                prefix = self.prefixes.get(namesp, None) # @@ #CONVENTION
+                if prefix != None : return prefix + u":" + value[j+1:]
+            
+                if value[:j] == self.base:   # If local to output stream,
+                    return u"<#" + value[j+1:] + u">" # use local frag id
         
-class RDFStore(RDFSink) :
-    """ Absorbs RDF stream and saves in triple store
+        if "r" not in self._flags and self.base != None:
+            value = hexify(refTo(self.base, value))
+        elif "u" in self._flags: value = backslashUify(value)
+        else: value = hexify(value)
+
+        return u"<" + value + u">"    # Everything else
+
+def nothing():
+    pass
+
+import triple_maker as tm
+
+LIST = 10000
+QUESTION = 10001
+class tmToN3(RDFSink.RDFSink):
     """
 
-    def __init__(self, engine):
-        RDFSink.__init__(self)
-        self.engine = engine
 
-# Input methods:
+    """
+    def __init__(self, write, base=None, genPrefix = None,
+                                    noLists=0 , quiet=0, flags=""):
+        gp = genPrefix
+        if gp == None:
+            gp = "#_g"
+            if base!=None: 
+                try:
+                    gp = uripath.join(base, "#_g")
+                except ValueError:
+                    pass # bogus: base eg
+        RDFSink.RDFSink.__init__(self, gp)
+        self._write = self.writeEncoded
+        self._writeRaw = write
+        self._quiet = quiet or "c" in flags
+        self._flags = flags
+        self._subj = None
+        self.prefixes = {}      # Look up prefix conventions
+        self.defaultNamespace = None
+        self.indent = 1         # Level of nesting of output
+        self.base = base
+#       self.nextId = 0         # Regenerate Ids on output
+        self.regen = {}         # Mapping of regenerated Ids
+#       self.genPrefix = genPrefix  # Prefix for generated URIs on output
+        self.noLists = noLists  # Suppress generation of lists?
+        self._anodeName = {} # For "a" flag
+        self._anodeId = {} # For "a" flag - reverse mapping
 
-    def makeStatement(self, tuple):
-        q = ( self.engine.intern(tuple[CONTEXT]),
-              self.engine.intern(tuple[PRED]),
-              self.engine.intern(tuple[SUBJ]),
-              self.engine.intern(tuple[OBJ]) )
-        s = StoredStatement(q)
-        for p in ALL4: s.triple[p].occursAs[p].append(s)
-                    
-    def startDoc(self):
+        if "l" in self._flags: self.noLists = 1
+    
+    def writeEncoded(self, str):
+        """Write a possibly unicode string out to the output"""
+        return self._writeRaw(str.encode('utf-8'))
+
+    def _newline(self, extra=0):
+        self._needNL = 0
+        self._write("\n"+ "    " * (self.indent+extra))
+        
+    def bind(self, prefixString, uri):
+        """ Just accepting a convention here """
+        assert ':' in uri # absolute URI references only
+        if "p" in self._flags: return  # Ignore the prefix system completely
+        if not prefixString:
+            return self.setDefaultNamespace(uri)
+        
+        if (uri == self.defaultNamespace
+            and "d" not in self._flags): return # don't duplicate ??
+        self.endStatement()
+        self.prefixes[uri] = prefixString
+        self._write(" @prefix %s: <%s> ." %
+                            (prefixString, refTo(self.base, uri)) )
+        self._newline()
+
+    def setDefaultNamespace(self, uri):
+        if "d" in self._flags or "p" in self._flags: return  # no prefix system
+        self.endStatement()
+        self.defaultNamespace = uri
+        if self.base:  # Sometimes there is none, and now refTo is intolerant
+            x = refTo(self.base, uri)
+        else:
+            x = uri
+        self._write(" @prefix : <%s> ." % x )
+        self._newline()
+    
+    def start(self):
         pass
+        self._parts = [0]
+        self._types = [None]
+        self._nodeEnded = False
 
-    def endDoc(self):
-        pass
+    def end(self):
+        self._write('\n\n#End')
 
-    def selectDefaultPrefix(self, context):
+    def addNode(self, node):
+        self._parts[-1] += 1
+        if node is not None:
+            self._realEnd()
+            if self._types == LITERAL:
+                lit, dt, lang = node
+                singleLine = "n" in self._flags
+                if dt != None and "n" not in self._flags:
+                    dt_uri = dt          
+                    if (dt_uri == INTEGER_DATATYPE):
+                        self._write(str(long(lit)))
+                        return
+                    if (dt_uri == FLOAT_DATATYPE):
+                        self._write(str(float(lit))) # numeric python-normalized
+                        return
+                    if (dt_uri == DECIMAL_DATATYPE):
+                        self._write(str(Decimal(lit)))
+                        return
+                st = stringToN3(lit, singleLine= singleLine, flags=self._flags)
+                if lang != None: st = st + "@" + lang
+                if dt != None: st = st + "^^" + self.symbolString(dt)
+                self._write(st)
+            elif self._types == SYMBOL:
+                self._write(self.symbolString(node) + ' ')
 
-        """ Resource whose fragments have the most occurrences
-        """
-        best = 0
-        mp = None
-        for r in self.engine.resources.values() :
-            total = 0
-            for f in r.fragments.values():
-                total = total + (f.occurrences(PRED,context)+
-                                 f.occurrences(SUBJ,context)+
-                                 f.occurrences(OBJ,context))
+            elif self._types == QUESTION:
+                self._write('?' + node + ' ')
 
-            if total > 3 and chatty:
-                print "#   Resource %s has %i occurrences in %s" % (`r`, total, `context`)
-            if total > best :
-                best = total
-                mp = r
-        if chatty: print "# Most popular Namesapce in %s is %s" % (`context`, `mp`)
-        defns = self.namespaces.get("", None)
-        if defns :
-            del self.namespaces[""]
-            del self.prefixes[defns]
-        if self.prefixes.has_key(mp) :
-            oldp = self.prefixes[mp]
-            del self.prefixes[mp]
-            del self.namespaces[oldp]
-        self.prefixes[mp] = ""
-        self.namespaces[""] = mp
-        
-# Manipulation methods:
-
-    def moveContext(self, old, new):
-        for s in old.occursAs[CONTEXT] :
-            t = s.triple
-#            print "Quad:", `s.triple`, "Old, new:",`old`, `new`
-            s.triple = new, t[PRED], t[SUBJ], t[OBJ]
-            old.occursAs[CONTEXT].remove(s)
-            
-            
-    def copyContext(self, old, new):
-        for s in self.statements :
-            if s.triple[CONTEXT] == old:
-                self.makeStatement((new, s.triple[PRED], s.triple[SUBJ], s.triple[OBJ]))
-            
-# Output methods:
-
-    def dumpChronological(self, contextURI, sink):
-        """ Ignores contexts
-        """
-        context = self.engine.intern((RESOURCE, contextURI))
-        sink.startDoc()
-        for c in self.prefixes.items():   #  bind in same way as input did FYI
-            sink.bind(c[1], c[0])
-        for s in context.occursAs[CONTEXT]:
-#        for s in self.statements :
-            self._outputStatement(sink, s)
-        sink.endDoc()
-
-    def _outputStatement(self, sink, s):
-        t = s.triple
-        sink.makeStatement((t[CONTEXT].asPair(),
-                            t[PRED].asPair(),
-                            t[SUBJ].asPair(),
-                            t[OBJ].asPair(),
-                            ))
-
-    def dumpBySubject(self, contextURI, sink):
-
-        context = self.engine.intern((RESOURCE, contextURI))
-        self.selectDefaultPrefix(context)        
-        sink.startDoc()
-        for c in self.prefixes.items() :   #  bind in same way as input did FYI
-            sink.bind(c[1], c[0])
-
-        for r in self.engine.resources.values() :  # First the bare resource
-            for s in r.occursAs[SUBJ] :
-                if context is s.triple[CONTEXT]:
-                    self._outputStatement(sink, s)
-            for f in r.fragments.values() :  # then anything in its namespace
-                for s in f.occursAs[SUBJ] :
-#                    print "...dumping %s in context %s" % (`s.triple[CONTEXT]`, `context`)
-                    if s.triple[CONTEXT] is context:
-                        self._outputStatement(sink, s)
-        sink.endDoc()
-#
-#  Pretty printing
-#
-    def dumpNested(self, contextURI, sink):
-        """ Iterates over all URIs ever seen looking for statements
-        """
-        context = self.engine.intern((RESOURCE, contextURI))
-        self.selectDefaultPrefix(context)        
-        sink.startDoc()
-        for c in self.prefixes.items() :   #  bind in same way as input did FYI
-            sink.bind(c[1], c[0])
-        print "# RDFStore: Done bindings, doing arcs:" 
-        for r in self.engine.resources.values() :  # First the bare resource
-            self._dumpSubject(r, context, sink)
-            for f in r.fragments.values() :  # then anything in its namespace
-                self._dumpSubject(f, context, sink)
-        sink.endDoc()
-
-
-    def _dumpSubject(self, subj, context, sink):
-        """ Take care of top level anonymous nodes
-        """
-        print "%s occures %i as context, %i as pred, %i as subj, %i as obj" % (
-            `subj`, subj.occurrences(CONTEXT, None),
-            subj.occurrences(PRED,context), subj.occurrences(SUBJ,context),
-            subj.occurrences(OBJ, context))
-        if (subj.generated() and  # The URI is irrelevant
-                subj.occurrences(OBJ,context) == 0 and  # There is no incoming arrow
-                subj.occurrences(PRED,context) == 0 ):    # It is not used as a verb itself
-            if subj.occurrences(SUBJ,context) > 0 :   # Ignore if actually no statements for this thing
-                sink.startAnonymousNode(subj)
-                for s in subj.occursAs[SUBJ]:
-                    if s.triple[CONTEXT] is context:
-                        self.coolMakeStatement(sink, s)
-                sink.endAnonymousNode()
-            if subj.occurrences(CONTEXT, None) > 0:  # @@@ only dumps of no statemenst about it
-                sink.startBag(subj)
-                raise theRoof
-                self.dumpNested(subj, sink)  # dump contents of anonymous bag
-                sink.endBag(subj)
-
-        else:
-            for s in subj.occursAs[SUBJ]:
-                if s.triple[CONTEXT] is context:
-                    self.coolMakeStatement(sink, s)
-
-    def coolMakeStatement(self, sink, s):
-        triple = s.triple
-        if triple[SUBJ] is triple[OBJ]:
-            self.outputStatement(s)
-        else:
-            if not triple[SUBJ].n3_anonymous(triple[CONTEXT]):  # Don't repeat
-                self.coolMakeStatement2(sink, s)
-                
-    def coolMakeStatement2(self, sink, s):
-        triple = s.triple
-        if triple[OBJ].n3_anonymous(triple[CONTEXT]):  # Can be represented as anonymous node in N3
-            sink.startAnonymous( triple)
-            for t in triple[OBJ].occursAs[SUBJ]:
-                if t.triple[CONTEXT] is triple[CONTEXT]:
-                    self.coolMakeStatement2(sink, t)
-            sink.endAnonymous(triple[SUBJ], triple[PRED]) # Restore context
-        else:    
-            self._outputStatement(sink, s)
-                
-
-
-            
-class RDFTriple:
-    
-    def __init__(self, triple):
-        self.triple = triple
-        triple[SUBJ].occursAs[SUBJ].append(self)   # Resource index
-        triple[PRED].occursAs[PRED].append(self)   # Resource index
-        triple[OBJ].occursAs[OBJ].append(self)     # Resource index
-        triple[CONTEXT].occursAs[CONTEXT].append(self) #
-
-############################################################## Query engine
-
-# Template matching in a graph
-
-    
-
-INFINITY = 1000000000           # @@ larger than any number occurences
-def match (unmatched, action, param, bindings = [], newBindings = [] ):
-
-        """ Apply action(bindings, param) to succussful matches
-    bindings      collected matches alreday found
-    newBindings  matches found and not yet applied - used in recursion
-        """
-# Scan terms to see what sort of a problem we have:
-#
-# We prefer terms with a single variable to those with two.
-# (Those with none we immediately check and therafter ignore)
-# Secondarily, we prefer short searches to long ones.
-
-        total = 0           # Number of matches found (recursively)
-        shortest = INFINITY
-        shortest_t = None
-        found_single = 0   # Singles are better than doubles
-        unmatched2 = unmatched[:] # Copy so we can remove() while iterating :-(
-
-        for pair in newBindings:
-            bindings.append(pair)  # Record for posterity
-            for t in unmatched:     # Replace variables with values
-                for p in SUBJ, PRED, OBJ:
-                    if t[p] is pair[0] : t[p] = pair[1]
-        
-        for t in unmatched:
-            vars = []       # Count where variables are
-            q = []          # Count where constants are
-            short_p = -1
-            short = INFINITY
-            for p in PRED, SUBJ, OBJ:
-                r = t.triple[p]
-                if isinstance(r,Variable):
-                    vars.append(r)
-                else:
-                    if r.occurs[p]< short:
-                        short_p = p
-                        short = r.occurs[p]
-                        consts.append(p)
-
-            if short == 0: return 0 # No way we can satisfy that one - quick "no"
-
-            if len(vars) == 0: # This is an independant constant triple
-                          # It has to match or the whole thing fails
-                 
-                for s in r.occursAs[short_p]:
-                    if (s.triple[q[0]] is t.triple[q[0]]
-                        and s.triple[q[1]] is t.triple[q[1]]):
-                            unmatched2.remove(t)  # Ok - we believe it - ignore it
-                    else: # no match for a constant term: query fails
-                        return 0
-                
-            elif len(vars) == 1: # We have a single variable.
-                if not found_single or short < shortest :
-                    shortest = short
-                    shortest_p = short_p
-                    shortest_t = t
-                    found_single = 1
-                
-            else:   # Has two variables
-                if not found_single and short < shortest :
-                    shortest = short
-                    shortest_p = short_p
-                    shortest_t = t
-
-        if len(unmatched2) == 0:
-            print "Found for bindings: ", bindings
-            action(bindings, param)  # No terms left .. success!
-            return 1
-
-        # Now we have identified the best statement to search for
-        t = shortest_t
-        parts_to_search = [ PRED, SUBJ, OBJ ]
-        unmatched2.remove(t)  # We will resolve this one now
-
-        q = []   # Parts of speech to test for match
-        v = []   # Parts of speech which are variables
-        for p in [PRED, SUBJ, OBJ] :
-            if isinstance(t.triple[p], Variable):
-                parts_to_search.remove(p)
-                v.append(p)
-            elif p != shortest_p :
-                q.append(p)
-
-        if found_single:        # One variable, two constants - must search
-            for s in t.occursAs[shortest_p]:
-                if s.triple[q[0]] is t.triple[q[0]]: # Found this one
-                    total = total + match(unmatched2, action, param,
-                                          bindings, [ s.triple[pv], s.triple[pv] ])
-            
-        else: # Two variables, one constant. Every one in occurrence list will be good
-            for s in t.occursAs[shortest_p]:
-                total = total + matches(unmatched2, action, param, bindings,
-                                        [ t.triple[v[0]], s.triple[v[0]]],
-                                        [ t.triple[v[1]], s.triple[v[1]]])
-            
-        return total
-         
-                            
-                    
-            
-        
-############################################################## Web service
-
-import random
-import time
-import cgi
-import sys
-import StringIO
-
-def serveRequest(env):
-    import random #for message identifiers. Hmm... should seed from request
-
-    #sys.stderr = open("/tmp/connolly-notation3-log", "w")
-
-    form = cgi.FieldStorage()
-
-    if form.has_key('data'):
-	try:
-	    convert(form, env)
-	except BadSyntax, e:
-	    print "Status: 500 syntax error in input data"
-	    print "Content-type: text/plain"
-	    print
-	    print e
-	    
-
-	except:
-	    import traceback
-
-	    print "Status: 500 error in python script. traceback follows"
-	    print "Content-type: text/plain"
-	    print
-	    traceback.print_exc(sys.stdout)
-	    
-    else:
-	showForm()
-
-def convert(form, env):
-    """ raises KeyError if the form data is missing required fields."""
-
-    serviceDomain = 'w3.org' #@@ should compute this from env['SCRIPT_NAME']
-         # or whatever; cf. CGI spec
-    thisMessage = 'mid:t%s-r%f@%s' % (time.time(), random.random(), serviceDomain)
-
-    data = form['data'].value
-
-    if form.has_key('genspace'):
-	genspace = form['genspace'].value
-    else: genspace = thisMessage + '#_'
-
-    if form.has_key('baseURI'):	baseURI = form['baseURI'].value
-    elif env.has_key('HTTP_REFERER'): baseURI = env['HTTP_REFERER']
-    else: baseURI = None
-
-    # output is buffered so that we only send
-    # 200 OK if all went well
-    buf = StringIO.StringIO()
-
-    xlate = ToRDFParser(buf, baseURI, thisMessage, genspace)
-    xlate.startDoc()
-    xlate.feed(data)
-    xlate.endDoc()
-
-    print "Content-Type: text/xml"
-    #hmm... other headers? last-modified?
-    # handle if-modified-since? i.e. handle input by reference?
-    print # end of HTTP response headers
-    print buf.getvalue()
-
-def showForm():
-    print """Content-Type: text/html
-
-<html>
-<title>A Wiki RDF Service</title>
-<body>
-
-<form method="GET">
-<textarea name="data" rows="4" cols="40">
-bind dc: &lt;http://purl.org/dc/elements/1.1/&gt;
-</textarea>
-<input type="submit"/>
-</form>
-
-<div>
-<h2>References</h2>
-<ul>
-<li><a href="http://www.w3.org/DesignIssues/Notation3">Notation 3</a></li>
-<li><a href="http://www.python.org/doc/">python documentation</a></li>
-<li><a href="http://www.w3.org/2000/01/sw/">Semantic Web Development</a></li>
-</ul>
-</div>
-
-<address>
-<a href="http://www.w3.org/People/Connolly/">Dan Connolly</a>
-</address>
-
-</body>
-</html>
-"""
-#################################################  Command line
-    
-def doCommand():
-        """Command line RDF/N3 tool
-        
- <command> <options> <inputURIs>
- 
- -rdf1out   Output in RDF M&S 1.0 insead of n3
- -pipe      Don't store, just pipe out *
- -ugly      Store input and regurgitate *
- -bySubject Store inpyt and regurgitate in subject order *
-            (default is to store and pretty print with anonymous nodes) *
- -help      print this message
- -chatty    Verbose output of questionable use
-
-            * mutually exclusive
- 
-"""
-        
-        import urllib
-        option_ugly = 0     # Store and regurgitate with genids *
-        option_pipe = 0     # Don't store, just pipe though
-        option_rdf1out = 0  # Output in RDF M&S 1.0 instead of N3
-        option_bySubject= 0 # Store and regurgitate in subject order *
-        option_inputs = []
-        chatty = 0          # not too verbose please
-        hostname = "localhost" # @@@@@@@@@@@ Get real one
-        
-        for arg in sys.argv[1:]:  # Command line options after script name
-            if arg == "-test": return test()
-            elif arg == "-ugly": option_ugly = 1
-            elif arg == "-pipe": option_pipe = 1
-            elif arg == "-bySubject": option_bySubject = 1
-            elif arg == "-rdf1out": option_rdf1out = 1
-            elif arg == "-chatty": chatty = 1
-            elif arg == "-help":
-                print doCommand.__doc__
-                return
-            elif arg[0] == "-": print "Unknown option", arg
-            else : option_inputs.append(arg)
-
-        # The base URI for this process - the Web equiv of cwd
-#	_baseURI = "file://" + hostname + os.getcwd() + "/"
-	_baseURI = "file://" + os.getcwd() + "/"
-	print "# Base URI of process is" , _baseURI
-	
-        _outURI = urlparse.urljoin(_baseURI, "STDOUT")
-	if option_rdf1out:
-            _outSink = ToRDF(sys.stdout, _outURI)
-        else:
-            _outSink = SinkToN3(sys.stdout.write, _outURI)
-
-        if option_pipe:
-            _sink = _outSink
-        else:
-            _sink = RDFStore()
-        
-#  Suck up the input information:
-
-        inputContexts = []
-        for i in option_inputs:
-            _inputURI = urlparse.urljoin(_baseURI, i) # Make abs from relative
-            inputContexts.append(intern(_inputURI))
-            print "# Input from ", _inputURI
-            netStream = urllib.urlopen(_inputURI)
-            p = SinkParser(_sink,  _inputURI)
-            p.startDoc()
-            p.feed(netStream.read())     # May be big - buffered in memory!
-            p.endDoc()
-        # note we can't do it in chunks as p stores no state between feed()s
-            del(p)
-        if option_inputs == []:
-            _inputURI = urlparse.urljoin( _baseURI, "STDIN") # Make abs from relative
-            inputContexts.append(intern(_inputURI))
-            print "# Taking input from standard input"
-            p = SinkParser(_sink,  _inputURI)
-            p.startDoc()
-            p.feed(sys.stdin.read())     # May be big - buffered in memory!
-            p.endDoc()
-            del(p)
-
-        if option_pipe: return                # everything was done inline
-
-# Manpulate it as directed:
-
-        outputContext = intern(_outURI)
-        for i in inputContexts:
-            _sink.moveContext(i,outputContext)
-            
-#@@@@@@@@@@@ problem of deciding which contexts to dump and dumping > 1
-                #@@@ or of merging contexts
-
-# Squirt it out again as directed
-        
-        if not option_pipe:
-            if option_ugly:
-                _sink.dumpChronological(outputContext, _outSink)
-            elif option_bySubject:
-                _sink.dumpBySubject(outputContext, _outSink)
+    def _realEnd(self):
+        if self._nodeEnded:
+            self._nodeEnded = False
+            if self._parts[-1] == 1:
+                self._write(' . \n')
+            elif self._parts[-1] == 2:
+                self._write(';\n')
+            elif self._parts[-1] == 3:
+                self._write(',\n')
             else:
-                _sink.dumpNested(outputContext, _outSink)
-                
-
-############################################################ Main program
+                pass
     
-if __name__ == '__main__':
-    import os
-    import urlparse
-    if os.environ.has_key('SCRIPT_NAME'):
-	serveRequest(os.environ)
+    def symbolString(self, value):
+        j = string.rfind(value, "#")
+        if j<0: #and "/" in self._flags:
+            j=string.rfind(value, "/")   # Allow "/" namespaces as a second best
+        
+        if (j>=0
+            and "p" not in self._flags):   # Suppress use of prefixes?
+            for ch in value[j+1:]:  #  Examples: "." ";"  we can't have in qname
+                if ch in _notNameChars:
+                    if verbosity() > 0:
+                        progress("Cannot have character %i in local name."
+                                            % ord(ch))
+                    break
+            else:
+                namesp = value[:j+1]
+                if (self.defaultNamespace
+                    and self.defaultNamespace == namesp
+                    and "d" not in self._flags):
+                    return ":"+value[j+1:]
+                self.countNamespace(namesp)
+                prefix = self.prefixes.get(namesp, None) # @@ #CONVENTION
+                if prefix != None : return prefix + ":" + value[j+1:]
+            
+                if value[:j] == self.base:   # If local to output stream,
+                    return "<#" + value[j+1:] + ">" #   use local frag id
+        
+        if "r" not in self._flags and self.base != None:
+            value = refTo(self.base, value)
+        elif "u" in self._flags: value = backslashUify(value)
+        else: value = hexify(value)
+
+        return "<" + value + ">"    # Everything else
+        
+    def IsOf(self):
+        self._write('is ')
+        self._predIsOfs[-1] = FRESH
+
+    def checkIsOf(self):
+        return self._predIsOfs[-1]
+
+    def forewardPath(self):
+        self._write('!')
+        
+    def backwardPath(self):
+        self._write('^')
+        
+    def endStatement(self):
+        self._parts[-1] = 0
+        self._nodeEnded = True
+
+    def addLiteral(self, lit, dt=None, lang=None):
+        self._types = LITERAL
+        self.addNode((lit, dt, lang))
+
+    def addSymbol(self, sym):
+        self._types = SYMBOL
+        self.addNode(sym)
+    
+    def beginFormula(self):
+        self._realEnd()
+        self._parts.append(0)
+        self._write('{')
+
+    def endFormula(self):
+        self._parts.pop()
+        self._write('}')
+        self._types = None
+        self.addNode(None)
+
+    def beginList(self):
+        self._realEnd()
+        self._parts.append(-1)
+        self._write('(')
+
+    def endList(self):
+        self._parts.pop()
+        self._types = LIST
+        self._write(') ')
+        self.addNode(None)
+
+    def addAnonymous(self, Id):
+        """If an anonymous shows up more than once, this is the
+        function to call
+
+        """
+        if Id not in bNodes:
+            a = self.formulas[-1].newBlankNode()
+            bNodes[Id] = a
+        else:
+            a = bNodes[Id]
+        self.addNode(a)
+        
+    
+    def beginAnonymous(self):
+        self._realEnd()
+        self._parts.append(0)
+        self._write('[')
+        
+
+    def endAnonymous(self):
+        self._parts.pop()
+        self._write(']')
+        self._types = None
+        self.addNode(None)
+
+    def declareExistential(self, sym):
+        self._write('@forSome ' + sym + ' . ')
+
+    def declareUniversal(self, sym):
+        self._write('@forAll ' + sym + ' . ')
+
+    def addQuestionMarkedSymbol(self, sym):
+        self._types = QUESTION
+        self.addNode(sym)
+
+        
+###################################################
+#
+#   Utilities
+#
+
+Escapes = {'a':  '\a',
+           'b':  '\b',
+           'f':  '\f',
+           'r':  '\r',
+           't':  '\t',
+           'v':  '\v',
+           'n':  '\n',
+           '\\': '\\',
+           '"':  '"'}
+
+forbidden1 = re.compile(ur'[\\\"\a\b\f\r\v\u0080-\U0000ffff]')
+forbidden2 = re.compile(ur'[\\\"\a\b\f\r\v\t\n\u0080-\U0000ffff]')
+#"
+def stringToN3(str, singleLine=0, flags=""):
+    res = u''
+    if (len(str) > 20 and
+        str[-1] <> u'"' and
+        not singleLine and
+        (string.find(str, u"\n") >=0 
+         or string.find(str, u'"') >=0)):
+        delim= u'"""'
+        forbidden = forbidden1   # (allow tabs too now)
     else:
-        doCommand()
+        delim = u'"'
+        forbidden = forbidden2
+        
+    i = 0
+
+    while i < len(str):
+        m = forbidden.search(str, i)
+        if not m:
+            break
+
+        j = m.start()
+        res = res + str[i:j]
+        ch = m.group(0)
+        if ch == u'"' and delim == u'"""' and str[j:j+3] != u'"""':  #"
+            res = res + ch
+        else:
+            k = string.find(u'\a\b\f\r\t\v\n\\"', ch)
+            if k >= 0: res = res + u"\\" + u'abfrtvn\\"'[k]
+            else:
+                if 'e' in flags:
+#                res = res + ('\\u%04x' % ord(ch))
+                    res = res + (u'\\u%04X' % ord(ch)) 
+                    # http://www.w3.org/TR/rdf-testcases/#ntriples
+                else:
+                    res = res + ch
+        i = j + 1
+
+    # The following code fixes things for really high range Unicode
+    newstr = u""
+    for ch in res + str[i:]:
+        if ord(ch)>65535:
+            newstr = newstr + (u'\\U%08X' % ord(ch)) 
+                # http://www.w3.org/TR/rdf-testcases/#ntriples
+        else:
+            newstr = newstr + ch
+    #
+
+    return delim + newstr + delim
+
+def backslashUify(ustr):
+    """Use URL encoding to return an ASCII string corresponding
+        to the given unicode"""
+#    progress("String is "+`ustr`)
+#    s1=ustr.encode('utf-8')
+    str  = u""
+    for ch in ustr:  # .encode('utf-8'):
+        if ord(ch) > 65535:
+            ch = u"\\U%08X" % ord(ch)       
+        elif ord(ch) > 126:
+            ch = u"\\u%04X" % ord(ch)
+        else:
+            ch = u"%c" % ord(ch)
+        str = str + ch
+    return str
+
+def hexify(ustr):
+    """Use URL encoding to return an ASCII string
+    corresponding to the given UTF8 string
+
+    >>> hexify("http://example/a b")
+    'http://example/a%20b'
+    
+    """   #"
+#    progress("String is "+`ustr`)
+#    s1=ustr.encode('utf-8')
+    str  = ""
+    for ch in ustr:  # .encode('utf-8'):
+        if ord(ch) > 126 or ord(ch) < 33 :
+            ch = "%%%02X" % ord(ch)
+        else:
+            ch = "%c" % ord(ch)
+        str = str + ch
+    return str
+    
+def dummy():
+        res = ""
+        if len(str) > 20 and (string.find(str, "\n") >=0 
+                                or string.find(str, '"') >=0):
+                delim= '"""'
+                forbidden = "\\\"\a\b\f\r\v"    # (allow tabs too now)
+        else:
+                delim = '"'
+                forbidden = "\\\"\a\b\f\r\v\t\n"
+        for i in range(len(str)):
+                ch = str[i]
+                j = string.find(forbidden, ch)
+                if ch == '"' and delim == '"""' \
+                                and i+1 < len(str) and str[i+1] != '"':
+                    j=-1   # Single quotes don't need escaping in long format
+                if j>=0: ch = "\\" + '\\"abfrvtn'[j]
+                elif ch not in "\n\t" and (ch < " " or ch > "}"):
+                    ch = "[[" + `ch` + "]]" #[2:-1] # Use python
+                res = res + ch
+        return delim + res + delim
+
+def _test():
+    import doctest
+    doctest.testmod()
+
+
+if __name__ == '__main__':
+    _test()
+
+#ends
 
