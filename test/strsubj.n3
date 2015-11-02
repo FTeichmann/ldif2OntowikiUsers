@@ -1,5 +1,0 @@
-# RDF serializer turns this into
-#  <String rdf:about="abc">
-# which is bogus
-
-"abc" a <#String>.

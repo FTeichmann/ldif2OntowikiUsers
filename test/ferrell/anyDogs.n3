@@ -1,3 +1,0 @@
-@prefix bio: <biology.n3#>. 
-
-{ ?x a bio:Dog. } => { ?x a bio:Dog. }.

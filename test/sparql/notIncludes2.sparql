@@ -1,5 +1,0 @@
-PREFIX : <http://example#>
-SELECT *
-WHERE { OPTIONAL {GRAPH : {?x :b :c}}
-        FILTER (!bound(?x)) 
-}

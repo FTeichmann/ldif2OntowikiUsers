@@ -1,4 +1,0 @@
-@prefix : <http://yosi.us/unlambda#> .
-@keywords a, of, is .
-
-{?x a RootExpression; eval ?y} => {?x eval ?y} .

@@ -1,3 +1,0 @@
-@prefix : <witch#>.
-@keywords is, of, a.
-{ GIRL a WITCH } => { GIRL a WITCH }.

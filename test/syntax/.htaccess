@@ -1,3 +1,0 @@
-<Files ~ ".*\.tests$">
-   ForceType 'text/rdf+n3'
-</Files>
