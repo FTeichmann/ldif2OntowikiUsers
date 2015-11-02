@@ -55,7 +55,7 @@ def convert(path):
     blank = re.compile(r" *\r?\n")  #"
 #    lines = []
     inPerson = 0
-    dataline = re.compile(r'([a-zA-Z0-9_]*): +(.*)')
+    dataline = re.compile(r'([a-zA-Z0-9_]*):* +(.*)')
     base64line = re.compile(r'([a-zA-Z0-9_]*):: +(.*)')
     urlline = re.compile(r'([a-zA-Z0-9_]*):< +(.*)')
     commentLine = re.compile(r'^#.*')
@@ -78,7 +78,11 @@ def convert(path):
             l += buf[nextLine:eol]
             nextLine = eol+1
             break
+        #if l is empty, continue
         if l == "":
+            continue
+        #if l contains encoded jpeg, continue (encoding error in StringToN3)
+        if "jpeg" in l:
             continue
         while l and l[-1:] in "\r\n": l = l[:-1]
         
