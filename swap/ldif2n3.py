@@ -1,8 +1,6 @@
 #!/usr/bin/python
 """Convert ldif to n3 format.
-
 Syntax:    python ldif2n3.py  <file>
-
     This program is or was http://www.w3.org/2000/10/swap/pim/ldif2p3.py
     $Id$
     
@@ -55,7 +53,7 @@ def convert(path):
     blank = re.compile(r" *\r?\n")  #"
 #    lines = []
     inPerson = 0
-    dataline = re.compile(r'([a-zA-Z0-9_]*): +(.*)')
+    dataline = re.compile(r'([a-zA-Z0-9_]*):* +(.*)')
     base64line = re.compile(r'([a-zA-Z0-9_]*):: +(.*)')
     urlline = re.compile(r'([a-zA-Z0-9_]*):< +(.*)')
     commentLine = re.compile(r'^#.*')
@@ -78,7 +76,11 @@ def convert(path):
             l += buf[nextLine:eol]
             nextLine = eol+1
             break
+        #if l is empty, continue
         if l == "":
+            continue
+        #if l contains encoded jpeg, continue (encoding error in StringToN3)
+        if "jpeg" in l:
             continue
         while l and l[-1:] in "\r\n": l = l[:-1]
         
@@ -169,4 +171,4 @@ for arg in sys.argv[1:]:
 # if files == []: files = [ "Makefile" ] # Default to Makefile
 
 for path in files:
-    do(path)
+    do(path
