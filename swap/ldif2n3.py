@@ -49,13 +49,13 @@ def convert(path):
     input.close()
 
     nextLine = 0
-    
-    blank = re.compile(r" *\r?\n")  #"
+
+    blank = re.compile(r' *$') 
 #    lines = []
     inPerson = 0
-    dataline = re.compile(r'([a-zA-Z0-9_]*):* +(.*)')
+    dataline = re.compile(r'([a-zA-Z0-9_]*): +(.*)')
     base64line = re.compile(r'([a-zA-Z0-9_]*):: +(.*)')
-    urlline = re.compile(r'([a-zA-Z0-9_]*):< +(.*)')
+    urlline = re.compile(r'([a-zA-Z0-9_]*):<+(.*)')
     commentLine = re.compile(r'^#.*')
 
     
@@ -76,9 +76,7 @@ def convert(path):
             l += buf[nextLine:eol]
             nextLine = eol+1
             break
-        #if l is empty, continue
-        if l == "":
-            continue
+        #    continue
         #if l contains encoded jpeg, continue (encoding error in StringToN3)
         if "jpeg" in l:
             continue
@@ -101,6 +99,7 @@ def convert(path):
             if m:
                 field = m.group(1)
                 value = base64.decodestring(m.group(2))
+
             else:
                 m = urlline.match(l)
                 if m:
@@ -171,4 +170,4 @@ for arg in sys.argv[1:]:
 # if files == []: files = [ "Makefile" ] # Default to Makefile
 
 for path in files:
-    do(path
+    do(path)
