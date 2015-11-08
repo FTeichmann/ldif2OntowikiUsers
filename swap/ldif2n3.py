@@ -108,6 +108,8 @@ def convert(path):
                     valtype = 'SYMBOL' 
         if m:
             if not inPerson:
+                #print subject here?
+                #use dn path to parse into foaf:name or a sioc:User
                 print "    ["
                 inPerson = 1
                 
