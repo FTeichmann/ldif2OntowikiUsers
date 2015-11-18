@@ -10,7 +10,7 @@ import java.io.*;
 
 public class Reasoner{
 
-    static final String inputFileName  = "dataset.rdf";
+    static final String inputFileName  = "answer.xml";
     
     public static void main (String args[]) {
     	//deactivate log4j logging
@@ -25,12 +25,12 @@ public class Reasoner{
         // read the RDF/XML file
         model.read(in, "");
         //generate Reasoner instance
-        GenericRuleReasoner reasoner = new GenericRuleReasoner(Rule.rulesFromURL("file:rules.txt"));
+        GenericRuleReasoner reasoner = new GenericRuleReasoner(Rule.rulesFromURL("file:mappingrules"));
         //generate inferred Model
         InfModel infModel = ModelFactory.createInfModel(reasoner, model);
         infModel.prepare();
-        
+        Model deductions = infModel.getDeductionsModel();
         // write it to standard out
-        infModel.write(System.out);            
+        deductions.write(System.out);            
     }
 }

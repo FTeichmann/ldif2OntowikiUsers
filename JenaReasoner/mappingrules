@@ -1,0 +1,23 @@
+# A Mapping from ldif exported rdf to the ontowikiusers graph
+# detailed information on the Jena rule Syntax can be found under:
+# http://jena.apache.org/documentation/inference/index.html#RULEsyntax
+
+@prefix base <http://localhost/OntoWiki/Config/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix ldif: <http://www.w3.org/2007/ont/ldif#> .
+@prefix sioc: <http://rdfs.org/sioc/ns#> .
+@prefix sysont: <http://ns.ontowiki.net/SysOnt/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+#foaf:mbox == sioc:email?
+#mapping ldif blank nodes to sioc:User with ldif:uid as identifier
+#[usernode:
+#    (?s ldif:uid ?o) (?s foaf:mbox ?m) 
+#    -> (?o a sioc:User) (?o sioc:email ?m)
+#]
+
+[usernode:
+    (?s ldif:uid ?o), makeTemp(?d)
+    -> (?d base:a sioc:User)
+]
