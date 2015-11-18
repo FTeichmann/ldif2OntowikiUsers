@@ -18,6 +18,12 @@
 #]
 
 [usernode:
-    (?s ldif:uid ?o), (?s foaf:mbox ?m), uriConcat(base:,?o,?x)
-    -> (?x base:a sioc:User)
+    (?subject ldif:uid ?uidName), (?subject foaf:mbox ?mailAdress), 
+    uriConcat(base:,?uidName,?userSubject)
+    ->  
+        (?userSubject base:a sioc:User),
+        (?userSubject sioc:email ?mailAdress)
 ]
+#questions:
+#base:a??
+#what is the sioc:username?
