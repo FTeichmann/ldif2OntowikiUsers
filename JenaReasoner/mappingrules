@@ -18,6 +18,6 @@
 #]
 
 [usernode:
-    (?s ldif:uid ?o), makeTemp(?d)
-    -> (?d base:a sioc:User)
+    (?s ldif:uid ?o), (?s foaf:mbox ?m), uriConcat(base:,?o,?x)
+    -> (?x base:a sioc:User)
 ]
