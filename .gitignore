@@ -8,6 +8,7 @@ test.*
 
 *.ttl
 *.rdf
+*.xml
 JenaReasoner/bin/*
 JenaReasoner/.classpath
 JenaReasoner/src/tutorial

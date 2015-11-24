@@ -29,6 +29,7 @@ public class Reasoner{
         //generate inferred Model
         InfModel infModel = ModelFactory.createInfModel(reasoner, model);
         infModel.prepare();
+        //gather only deducted Triples
         Model deductions = infModel.getDeductionsModel();
         // write it to standard out
         deductions.write(System.out);            

@@ -2,6 +2,7 @@
 # detailed information on the Jena rule Syntax can be found under:
 # http://jena.apache.org/documentation/inference/index.html#RULEsyntax
 
+#edit base to adjust subject
 @prefix base <http://localhost/OntoWiki/Config/> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .
@@ -10,20 +11,15 @@
 @prefix sysont: <http://ns.ontowiki.net/SysOnt/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 
-#foaf:mbox == sioc:email?
-#mapping ldif blank nodes to sioc:User with ldif:uid as identifier
-#[usernode:
-#    (?s ldif:uid ?o) (?s foaf:mbox ?m) 
-#    -> (?o a sioc:User) (?o sioc:email ?m)
-#]
-
 [usernode:
     (?subject ldif:uid ?uidName), (?subject foaf:mbox ?mailAdress), 
+    (?subject ldif:userPassword ?encodedPassword),
     uriConcat(base:,?uidName,?userSubject)
     ->  
-        (?userSubject base:a sioc:User),
+        (?userSubject rdf:type sioc:User),
+        (?userSubject ldif:uid ?uidName),
+        (?userSubject foaf:accountName ?uidName),
+        (?userSubject sysont:userPassword ?encodedPassword),
         (?userSubject sioc:email ?mailAdress)
 ]
-#questions:
-#base:a??
-#what is the sioc:username?
+
