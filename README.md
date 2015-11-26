@@ -1,4 +1,4 @@
-Parser for ldif->rdf to Import into Jena
+Parser for ldif->rdf to import into OntowikiUsers Graph
 ===
 
 This project uses the ldif parser from  
