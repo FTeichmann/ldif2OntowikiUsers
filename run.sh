@@ -1,4 +1,4 @@
-##!bin/bash
+#!bin/bash
 ##read in variables
 # Transform long options to short ones
 for arg in "$@"; do
