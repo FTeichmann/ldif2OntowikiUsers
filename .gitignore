@@ -1,4 +1,5 @@
 test.*
+runtest.sh
 *.txt
 *.pyc
 
@@ -9,7 +10,7 @@ test.*
 *.ttl
 *.rdf
 *.xml
-JenaReasoner/bin/*
+JenaReasoner/bin/tutorial/*
 JenaReasoner/.classpath
 JenaReasoner/src/tutorial
 JenaReasoner/.project
