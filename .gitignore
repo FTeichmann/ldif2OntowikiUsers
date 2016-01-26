@@ -1,4 +1,6 @@
-test.*
+*test.*
+data/
+*~
 runtest.sh
 *.txt
 *.pyc

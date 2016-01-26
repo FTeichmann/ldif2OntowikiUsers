@@ -13,13 +13,14 @@
 
 [usernode:
     (?subject ldif:uid ?uidName), (?subject foaf:mbox ?mailAdress), 
-    (?subject ldif:userPassword ?encodedPassword),
+    (?subject ldif:userPassword ?encodedPassword),(?subject ldif:dn ?dn)
     uriConcat(base:,?uidName,?userSubject)
     ->  
         (?userSubject rdf:type sioc:User),
         (?userSubject ldif:uid ?uidName),
         (?userSubject foaf:accountName ?uidName),
-        (?userSubject sysont:userPassword ?encodedPassword),
+        (?userSubject sysont:authenticateViaLdap 'true'),
+        (?userSubject ldif:dn ?dn),
         (?userSubject sioc:email ?mailAdress)
 ]
 
