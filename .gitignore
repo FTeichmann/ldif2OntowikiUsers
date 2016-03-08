@@ -1,22 +1,25 @@
+#Testing and development
 *test.*
-data/
-*~
 runtest.sh
 *.txt
 *.pyc
+defaultmapping
 
+#sensitive data
+data/
 *.ldif
-
 *.pdf
-
 *.ttl
 *.rdf
 *.xml
+config.ini
+
+#Java tutorial
 JenaReasoner/bin/tutorial/*
 JenaReasoner/.classpath
 JenaReasoner/src/tutorial
 JenaReasoner/.project
 JenaReasoner/.settings/*
 FoafMapper.java
-defaultmapping
+
 

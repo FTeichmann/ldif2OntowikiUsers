@@ -1,7 +1,7 @@
 Parser for ldif->rdf to import into OntowikiUsers Graph
 ===
 
-This project uses the ldif parser from  
+This project uses the ldif parser from
 https://github.com/linkeddata/swap
 to generate RDF (n3) out of ldif user data.
 
@@ -25,3 +25,12 @@ run.sh
     --parser [/path/to/pythonParser]
     optional: --verbose"
 ```
+
+Cronjob
+===
+
+To enable an user data update routine, fill in config.ini.tpl and
+```
+mv config.ini.tpl config.ini
+```
+See cron.php for details.
