@@ -29,8 +29,8 @@ run.sh
 Cronjob
 ===
 
-To enable an user data update routine, fill in config.ini.tpl and
+To enable an user data update routine, fill in config.tpl and
 ```
-mv config.ini.tpl config.ini
+mv config.tpl config.php
 ```
 See cron.php for details.

@@ -1,5 +1,5 @@
 #Testing and development
-*test.*
+*test*
 runtest.sh
 *.txt
 *.pyc
@@ -12,7 +12,8 @@ data/
 *.ttl
 *.rdf
 *.xml
-config.ini
+config.php
+aksw.pem
 
 #Java tutorial
 JenaReasoner/bin/tutorial/*
@@ -22,4 +23,5 @@ JenaReasoner/.project
 JenaReasoner/.settings/*
 FoafMapper.java
 
+/tmp
 
