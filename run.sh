@@ -61,7 +61,7 @@ if [ ! -f $parser -o ! -r $parser -o ! -s $parser ]
         echo "$parser could not be found"
         exit 1;
 fi
-##parsing ldif to n3 with python parser
+#parsing ldif to n3 with python parser
 if [ $verbose == true ]
     then 
         echo "Parsing your ldif File to n3 with Python"

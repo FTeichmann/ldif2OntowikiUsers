@@ -140,7 +140,7 @@ def convert(path):
             continue
 
         print "# ERROR: Unknown line format:", l
-    print "]."
+#    print "]."
         
 
 def do(path):

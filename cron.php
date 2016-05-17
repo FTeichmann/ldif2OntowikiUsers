@@ -39,9 +39,12 @@ $handle = fopen($ldifTmp, "w");
 fwrite($handle, $ldifString);
 fclose($handle);
 // executing converting bash-script
-$shellAnswer = shell_exec('bash run.sh --input /tmp/'.$ldifTmp.' JenaReasoner/bin/reasoner/Reasoner.jar --mapping JenaReasoner/mappingrules --parser swap/ldif2n3.py');
-
+$shellAnswer = shell_exec('bash run.sh --input '.$ldifTmp.' --reasoner JenaReasoner/bin/reasoner/Reasoner.jar --mapping JenaReasoner/mappingrules --parser swap/ldif2n3.py');
 unlink($ldifTmp);
+$export = tempnam("./tmp", "ldapUserExport-");
+$handle = fopen($export, "w");
+fwrite($handle, $shellAnswer);
+fclose($handle);
 /*
 run.sh
               --input [ldif input file] 
