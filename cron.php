@@ -45,11 +45,3 @@ $export = tempnam("./tmp", "ldapUserExport-");
 $handle = fopen($export, "w");
 fwrite($handle, $shellAnswer);
 fclose($handle);
-/*
-run.sh
-              --input [ldif input file] 
-              --reasoner [/path/to/reasoner.jar] 
-              --mapping [mappingfile] 
-              --parser [/path/to/pythonParser]
-              optional: --verbose"
-*/
