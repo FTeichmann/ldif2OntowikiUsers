@@ -26,6 +26,11 @@ run.sh
     optional: --verbose"
 ```
 
+Adding Result to Ontowiki Usergraph
+===
+In this example, I use curl to pass the result to Ontowiki. Ontowiki-cli might be another option.
+See cron.php for details.
+
 Cronjob
 ===
 
