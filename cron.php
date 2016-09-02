@@ -45,4 +45,9 @@ $export = tempnam("./tmp", "ldapUserExport-");
 $handle = fopen($export, "w");
 fwrite($handle, $shellAnswer);
 fclose($handle);
-$shellAnswer = shell_exec('curl --user '.$OntowikiAdmin.':'.$OntowikiAdminPW.' -F "filetype-upload=rdfxml" -F "source=@'.$export.'" '.$ontowikipath.urlencode($usergraph));
+//delete outdated ldapusers ontology
+$shellAnswer = shell_exec('curl --user '.$OntowikiAdmin.':'.$OntowikiAdminPW.' '.$ontowikipath.'/model/delete/?model='.urlencode($usergraph));
+//re-create ldapusers ontology
+$shellAnswer = shell_exec('curl --user '.$OntowikiAdmin.':'.$OntowikiAdminPW.' -F "title=LdapUsers" -F "modeluri='.$usergraph.'" -F "importOptions=" -F "importAction=empty" '.$ontowikipath.'/model/create');
+//load result into ldapusers ontology
+$shellAnswer = shell_exec('curl --user '.$OntowikiAdmin.':'.$OntowikiAdminPW.' -F "filetype-upload=rdfxml" -F "source=@'.$export.'" '.$ontowikipath.'basicimporter/rdfupload/?m='.urlencode($usergraph));

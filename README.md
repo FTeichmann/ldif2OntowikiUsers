@@ -30,7 +30,7 @@ Adding Result to Ontowiki Usergraph
 ===
 In this example, I use curl to pass the result to Ontowiki. Ontowiki-cli might be another option.
 See cron.php for details.
-This will add all exported Data into the Graph. Therefore you can't delete users this way yet.
+This will add all exported Data into a special Ldapusers Graph. You need to owl:imports this graph into the Ontowiki Configuration Graph.
 
 Cronjob
 ===
