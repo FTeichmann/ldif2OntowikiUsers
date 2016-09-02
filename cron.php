@@ -45,3 +45,4 @@ $export = tempnam("./tmp", "ldapUserExport-");
 $handle = fopen($export, "w");
 fwrite($handle, $shellAnswer);
 fclose($handle);
+$shellAnswer = shell_exec('curl --user '.$OntowikiAdmin.':'.$OntowikiAdminPW.' -F "filetype-upload=rdfxml" -F "source=@'.$export.'" '.$ontowikipath.urlencode($usergraph));

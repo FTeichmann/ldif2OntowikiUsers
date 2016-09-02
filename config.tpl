@@ -11,5 +11,10 @@ $baseDN = '';
 $searchFilter = '';
 //String to define which entries to select for exporting
 $selectString = '';
+//Ontowiki Root Access
+$OntowikiAdmin = '';
+$OntowikiAdminPW = '';
 //Path to Ontowiki where to import the Users
-$ontowikipath = 'http://[path/to/ontowiki]/basicimporter/rdfupload/?m=http%3A%2F%2Fusergraph%2F';
+$ontowikipath = 'http://[path/to/ontowiki]/basicimporter/rdfupload/?m=';
+//Config / Usergraph of Ontowiki
+$usergraph = 'http://localhost/OntoWiki/Config/';
